@@ -1,0 +1,6 @@
+[submodule "Assets"]
+	path = Assets
+	url = https://github.com/vantixorg/source-assets.git
+[submodule "Game/assets"]
+	path = Game/assets
+	url = https://github.com/vantixorg/game-assets.git

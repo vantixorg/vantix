@@ -1,0 +1,43 @@
+using Godot;
+
+namespace Vantix.Smoke;
+
+/// <summary>Pure-logic grenade charge: longer hold = stronger throw (0..1). Deterministic and
+/// Godot-independent, so the server can replay it and match the client.</summary>
+public class GrenadeController
+{
+	/// <summary>Tuning reference; defaults to ConVars.Sv.</summary>
+	public SvConVars Sv = ConVars.Sv;
+
+	public float Charge { get; private set; }
+	public bool DidThrowThisFrame { get; private set; }
+	public float ThrownCharge { get; private set; }
+
+	private bool _wasHeld;
+
+	/// <summary>Server-replayable step. Detects the release edge and triggers the throw.</summary>
+	public void Step(GrenadeInput input)
+	{
+		DidThrowThisFrame = false;
+
+		if (!input.SlotActive)
+		{
+			Charge = 0f;
+			_wasHeld = false;
+			return;
+		}
+
+		if (input.ThrowHeld)
+		{
+			Charge = Mathf.Min(1f, Charge + input.Dt / Mathf.Max(0.01f, Sv.GrenadeChargeToFull));
+		}
+		else if (_wasHeld)
+		{
+			DidThrowThisFrame = true;
+			ThrownCharge = Mathf.Max(Sv.GrenadeMinCharge, Charge);
+			Charge = 0f;
+		}
+
+		_wasHeld = input.ThrowHeld;
+	}
+}

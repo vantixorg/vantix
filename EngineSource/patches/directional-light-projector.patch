@@ -1,0 +1,233 @@
+From: VANTIX project local patch
+Subject: [PATCH] Directional light projectors (cloud-shadow cookies)
+
+Stock Godot supports light_projector only for omni/spot lights; this adds it
+for DirectionalLight3D so a drifting cloud cookie can darken only the
+real-time sun contribution and respect the shadow map (only inside window
+light-shafts, not lamp-lit floor).
+
+- register directional projectors in the decal atlas
+- DirectionalLightData gains projector_rect + a view->light-plane
+  projector_matrix (C++ + GLSL, std140-aligned tail fields)
+- clustered directional loop samples the cookie with anisotropic textureGrad,
+  multiplies sun color (runtime-gated by projector_rect, no spec constant)
+- expose light_projector in the DirectionalLight3D inspector
+- per-light tuning via new light params PROJECTOR_WIND_X/Y (cookie drift,
+  tiles/sec) and PROJECTOR_TILE_SIZE (world units per tile); projector_matrix
+  applies a time-based wind offset. Defaults 0.012/0.006/40. Per-map, set in
+  the light's "Cloud Projector" inspector group. Forward+ only.
+
+Patch
+-----
+
+diff --git a/scene/3d/light_3d.cpp b/scene/3d/light_3d.cpp
+index 2f7d55fc..3641cc03 100644
+--- a/scene/3d/light_3d.cpp
++++ b/scene/3d/light_3d.cpp
+@@ -398,6 +398,11 @@ void Light3D::_bind_methods() {
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "light_bake_mode", PROPERTY_HINT_ENUM, "Disabled,Static,Dynamic"), "set_bake_mode", "get_bake_mode");
+ 	ADD_PROPERTY(PropertyInfo(Variant::INT, "light_cull_mask", PROPERTY_HINT_LAYERS_3D_RENDER), "set_cull_mask", "get_cull_mask");
+ 
++	ADD_GROUP("Cloud Projector", "cloud_projector_");
++	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "cloud_projector_wind_x", PROPERTY_HINT_RANGE, "-1,1,0.0001,or_greater,or_less"), "set_param", "get_param", PARAM_PROJECTOR_WIND_X);
++	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "cloud_projector_wind_y", PROPERTY_HINT_RANGE, "-1,1,0.0001,or_greater,or_less"), "set_param", "get_param", PARAM_PROJECTOR_WIND_Y);
++	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "cloud_projector_tile_size", PROPERTY_HINT_RANGE, "1,400,0.5,or_greater,suffix:m"), "set_param", "get_param", PARAM_PROJECTOR_TILE_SIZE);
++
+ 	ADD_GROUP("Shadow", "shadow_");
+ 	ADD_PROPERTY(PropertyInfo(Variant::BOOL, "shadow_enabled", PROPERTY_HINT_GROUP_ENABLE), "set_shadow", "has_shadow");
+ 	ADD_PROPERTYI(PropertyInfo(Variant::FLOAT, "shadow_bias", PROPERTY_HINT_RANGE, "0,10,0.001"), "set_param", "get_param", PARAM_SHADOW_BIAS);
+@@ -440,6 +445,9 @@ void Light3D::_bind_methods() {
+ 	BIND_ENUM_CONSTANT(PARAM_SHADOW_BLUR);
+ 	BIND_ENUM_CONSTANT(PARAM_TRANSMITTANCE_BIAS);
+ 	BIND_ENUM_CONSTANT(PARAM_INTENSITY);
++	BIND_ENUM_CONSTANT(PARAM_PROJECTOR_WIND_X);
++	BIND_ENUM_CONSTANT(PARAM_PROJECTOR_WIND_Y);
++	BIND_ENUM_CONSTANT(PARAM_PROJECTOR_TILE_SIZE);
+ 	BIND_ENUM_CONSTANT(PARAM_MAX);
+ 
+ 	BIND_ENUM_CONSTANT(BAKE_DISABLED);
+@@ -493,6 +501,9 @@ Light3D::Light3D(RenderingServer::LightType p_type) {
+ 	set_param(PARAM_SHADOW_FADE_START, 1);
+ 	// For OmniLight3D and SpotLight3D, specified in Lumens.
+ 	set_param(PARAM_INTENSITY, 1000.0);
++	set_param(PARAM_PROJECTOR_WIND_X, 0.012);
++	set_param(PARAM_PROJECTOR_WIND_Y, 0.006);
++	set_param(PARAM_PROJECTOR_TILE_SIZE, 40.0);
+ 	set_temperature(6500.0); // Nearly white.
+ 	set_disable_scale(true);
+ }
+@@ -552,7 +563,7 @@ void DirectionalLight3D::_validate_property(PropertyInfo &p_property) const {
+ 			p_property.usage = PROPERTY_USAGE_NO_EDITOR;
+ 		}
+ 	}
+-	if (p_property.name == "light_size" || p_property.name == "light_projector") {
++	if (p_property.name == "light_size") {
+ 		// Not implemented in DirectionalLight3D (`light_size` is replaced by `light_angular_distance`).
+ 		p_property.usage = PROPERTY_USAGE_NONE;
+ 	}
+diff --git a/scene/3d/light_3d.h b/scene/3d/light_3d.h
+index d412350c..04e71e6e 100644
+--- a/scene/3d/light_3d.h
++++ b/scene/3d/light_3d.h
+@@ -58,6 +58,9 @@ public:
+ 		PARAM_SHADOW_BLUR = RS::LIGHT_PARAM_SHADOW_BLUR,
+ 		PARAM_TRANSMITTANCE_BIAS = RS::LIGHT_PARAM_TRANSMITTANCE_BIAS,
+ 		PARAM_INTENSITY = RS::LIGHT_PARAM_INTENSITY,
++		PARAM_PROJECTOR_WIND_X = RS::LIGHT_PARAM_PROJECTOR_WIND_X,
++		PARAM_PROJECTOR_WIND_Y = RS::LIGHT_PARAM_PROJECTOR_WIND_Y,
++		PARAM_PROJECTOR_TILE_SIZE = RS::LIGHT_PARAM_PROJECTOR_TILE_SIZE,
+ 		PARAM_MAX = RS::LIGHT_PARAM_MAX
+ 	};
+ 
+diff --git a/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered.glsl b/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered.glsl
+index 740f77d0..6445d5a9 100644
+--- a/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered.glsl
++++ b/servers/rendering/renderer_rd/shaders/forward_clustered/scene_forward_clustered.glsl
+@@ -2616,11 +2616,30 @@ void fragment_shader(in SceneData scene_data) {
+ 
+ 			float size_A = sc_use_directional_soft_shadows() ? directional_lights.data[i].size : 0.0;
+ 
++			vec3 directional_color = directional_lights.data[i].color * directional_lights.data[i].energy;
++
++			if (directional_lights.data[i].projector_rect != vec4(0.0)) {
++				vec4 atlas_rect = directional_lights.data[i].projector_rect;
++				vec2 puv = (directional_lights.data[i].projector_matrix * vec4(vertex, 1.0)).xy;
++				vec2 proj_uv = fract(puv) * atlas_rect.zw + atlas_rect.xy;
++
++				// Always sample with explicit gradients so the projector gets proper
++				// trilinear/anisotropic filtering at grazing angles (no spec constant:
++				// use_light_projector is only set by omni/spot pairing). Derivatives come
++				// from the unwrapped uv so fract() seams don't spike the mip level.
++				vec2 puv_ddx = (directional_lights.data[i].projector_matrix * vec4(vertex + vertex_ddx, 1.0)).xy;
++				vec2 puv_ddy = (directional_lights.data[i].projector_matrix * vec4(vertex + vertex_ddy, 1.0)).xy;
++				vec2 proj_uv_ddx = (puv_ddx - puv) * atlas_rect.zw;
++				vec2 proj_uv_ddy = (puv_ddy - puv) * atlas_rect.zw;
++				vec4 proj = textureGrad(sampler2D(decal_atlas_srgb, light_projector_sampler), proj_uv, proj_uv_ddx, proj_uv_ddy);
++				directional_color *= proj.rgb * proj.a;
++			}
++
+ 			light_compute(normal, directional_lights.data[i].direction, normalize(view), size_A,
+ #ifndef DEBUG_DRAW_PSSM_SPLITS
+-					directional_lights.data[i].color * directional_lights.data[i].energy,
++					directional_color,
+ #else
+-					directional_lights.data[i].color * directional_lights.data[i].energy * tint,
++					directional_color * tint,
+ #endif
+ 					true, shadow, f0, roughness, metallic, directional_lights.data[i].specular, albedo, alpha, screen_uv, energy_compensation,
+ #ifdef LIGHT_BACKLIGHT_USED
+diff --git a/servers/rendering/renderer_rd/shaders/light_data_inc.glsl b/servers/rendering/renderer_rd/shaders/light_data_inc.glsl
+index edfe777d..443a599e 100644
+--- a/servers/rendering/renderer_rd/shaders/light_data_inc.glsl
++++ b/servers/rendering/renderer_rd/shaders/light_data_inc.glsl
+@@ -84,4 +84,6 @@ struct DirectionalLightData {
+ 	vec2 uv_scale2;
+ 	vec2 uv_scale3;
+ 	vec2 uv_scale4;
++	vec4 projector_rect; // projector rect in srgb decal atlas (zero = no projector)
++	mat4 projector_matrix; // view-space vertex -> tiled projector uv
+ };
+diff --git a/servers/rendering/renderer_rd/storage_rd/light_storage.cpp b/servers/rendering/renderer_rd/storage_rd/light_storage.cpp
+index 0c716857..ca23592a 100644
+--- a/servers/rendering/renderer_rd/storage_rd/light_storage.cpp
++++ b/servers/rendering/renderer_rd/storage_rd/light_storage.cpp
+@@ -240,18 +240,16 @@ void LightStorage::light_set_projector(RID p_light, RID p_texture) {
+ 
+ 	ERR_FAIL_COND(p_texture.is_valid() && !texture_storage->owns_texture(p_texture));
+ 
+-	if (light->type != RS::LIGHT_DIRECTIONAL && light->projector.is_valid()) {
++	if (light->projector.is_valid()) {
+ 		texture_storage->texture_remove_from_decal_atlas(light->projector, light->type == RS::LIGHT_OMNI);
+ 	}
+ 
+ 	light->projector = p_texture;
+ 
+-	if (light->type != RS::LIGHT_DIRECTIONAL) {
+-		if (light->projector.is_valid()) {
+-			texture_storage->texture_add_to_decal_atlas(light->projector, light->type == RS::LIGHT_OMNI);
+-		}
+-		light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT_SOFT_SHADOW_AND_PROJECTOR);
++	if (light->projector.is_valid()) {
++		texture_storage->texture_add_to_decal_atlas(light->projector, light->type == RS::LIGHT_OMNI);
+ 	}
++	light->dependency.changed_notify(Dependency::DEPENDENCY_CHANGED_LIGHT_SOFT_SHADOW_AND_PROJECTOR);
+ }
+ 
+ void LightStorage::light_set_negative(RID p_light, bool p_enable) {
+@@ -691,6 +689,35 @@ void LightStorage::update_light_buffers(RenderDataRD *p_render_data, const Paged
+ 
+ 				light_data.bake_mode = light->bake_mode;
+ 
++				// Light projector (e.g. drifting cloud cookie). Unlike stock Godot, directional
++				// lights are registered in the decal atlas, so the cookie modulates only the
++				// real-time sun contribution and respects the shadow map.
++				RID projector = light->projector;
++				if (projector.is_valid()) {
++					Rect2 rect = texture_storage->decal_atlas_get_texture_rect(projector);
++					light_data.projector_rect[0] = rect.position.x;
++					light_data.projector_rect[1] = rect.position.y;
++					light_data.projector_rect[2] = rect.size.width;
++					light_data.projector_rect[3] = rect.size.height;
++
++					const float projector_tile_size = light->param[RS::LIGHT_PARAM_PROJECTOR_TILE_SIZE];
++					const float projector_world_scale = projector_tile_size > 0.0 ? 1.0 / projector_tile_size : 0.025;
++					const Vector2 projector_wind = Vector2(light->param[RS::LIGHT_PARAM_PROJECTOR_WIND_X], light->param[RS::LIGHT_PARAM_PROJECTOR_WIND_Y]);
++					float ptime = p_render_data->scene_data ? p_render_data->scene_data->time : 0.0;
++					Transform3D to_light = light_transform.affine_inverse(); // world -> light local
++					Transform3D view_to_world = inverse_transform.affine_inverse(); // view -> world
++					Transform3D uv_xform;
++					uv_xform.basis.scale(Vector3(projector_world_scale, projector_world_scale, 1.0));
++					uv_xform.origin = Vector3(0.5 + projector_wind.x * ptime, 0.5 + projector_wind.y * ptime, 0.0);
++					Projection projector_matrix = Projection(uv_xform * to_light * view_to_world);
++					RendererRD::MaterialStorage::store_camera(projector_matrix, light_data.projector_matrix);
++				} else {
++					light_data.projector_rect[0] = 0;
++					light_data.projector_rect[1] = 0;
++					light_data.projector_rect[2] = 0;
++					light_data.projector_rect[3] = 0;
++				}
++
+ 				if (light_data.shadow_opacity > 0.001) {
+ 					RS::LightDirectionalShadowMode smode = light->directional_shadow_mode;
+ 
+diff --git a/servers/rendering/renderer_rd/storage_rd/light_storage.h b/servers/rendering/renderer_rd/storage_rd/light_storage.h
+index 6603ad7a..de997dd4 100644
+--- a/servers/rendering/renderer_rd/storage_rd/light_storage.h
++++ b/servers/rendering/renderer_rd/storage_rd/light_storage.h
+@@ -210,6 +210,8 @@ private:
+ 		float uv_scale2[2];
+ 		float uv_scale3[2];
+ 		float uv_scale4[2];
++		float projector_rect[4];
++		float projector_matrix[16];
+ 	};
+ 
+ 	uint32_t max_directional_lights;
+diff --git a/servers/rendering/rendering_server.cpp b/servers/rendering/rendering_server.cpp
+index ccaa6d09..ca6b30e0 100644
+--- a/servers/rendering/rendering_server.cpp
++++ b/servers/rendering/rendering_server.cpp
+@@ -2620,6 +2620,9 @@ void RenderingServer::_bind_methods() {
+ 	BIND_ENUM_CONSTANT(LIGHT_PARAM_SHADOW_BLUR);
+ 	BIND_ENUM_CONSTANT(LIGHT_PARAM_TRANSMITTANCE_BIAS);
+ 	BIND_ENUM_CONSTANT(LIGHT_PARAM_INTENSITY);
++	BIND_ENUM_CONSTANT(LIGHT_PARAM_PROJECTOR_WIND_X);
++	BIND_ENUM_CONSTANT(LIGHT_PARAM_PROJECTOR_WIND_Y);
++	BIND_ENUM_CONSTANT(LIGHT_PARAM_PROJECTOR_TILE_SIZE);
+ 	BIND_ENUM_CONSTANT(LIGHT_PARAM_MAX);
+ 
+ 	BIND_ENUM_CONSTANT(LIGHT_BAKE_DISABLED);
+diff --git a/servers/rendering/rendering_server.h b/servers/rendering/rendering_server.h
+index 6cf24e66..71665ac6 100644
+--- a/servers/rendering/rendering_server.h
++++ b/servers/rendering/rendering_server.h
+@@ -560,6 +560,9 @@ public:
+ 		LIGHT_PARAM_SHADOW_BLUR,
+ 		LIGHT_PARAM_TRANSMITTANCE_BIAS,
+ 		LIGHT_PARAM_INTENSITY,
++		LIGHT_PARAM_PROJECTOR_WIND_X,
++		LIGHT_PARAM_PROJECTOR_WIND_Y,
++		LIGHT_PARAM_PROJECTOR_TILE_SIZE,
+ 		LIGHT_PARAM_MAX
+ 	};
+ 
