@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 
 namespace Vantix.Character;
@@ -10,6 +27,8 @@ namespace Vantix.Character;
 public partial class LocalPlayer : NetworkPlayer
 {
 	private bool _reloadAudioWasActive;
+
+	protected override bool NeedsHitboxRig => false;
 
 	private void SendNetInput()
 	{
@@ -149,8 +168,6 @@ public partial class LocalPlayer : NetworkPlayer
 		return arr;
 	}
 
-	/// <summary>Picks gunshot reverb via an upward ceiling raycast: tunnel ground = Tunnel,
-	/// ceiling hit = Indoor, else Outdoor.</summary>
 	private ReverbEnv ProbeReverbEnv(HitInfo ground)
 	{
 		if (IsTunnelGround(ground)) return ReverbEnv.Tunnel;
@@ -161,8 +178,6 @@ public partial class LocalPlayer : NetworkPlayer
 		return ceiling.Hit ? ReverbEnv.Indoor : ReverbEnv.Outdoor;
 	}
 
-	/// <summary>Re-sims one tick from saved input; physics re-derived from current position.
-	/// Audio, FX and net-send skipped via _isReplaying.</summary>
 	private void ReplayOneTick(MovementInput savedInput)
 	{
 		Movement.Velocity = Velocity;
@@ -205,8 +220,6 @@ public partial class LocalPlayer : NetworkPlayer
 		_waitingForFadeOut = true;
 		InputGate.LocalPlayerFrozen = true;
 	}
-
-	protected override bool NeedsHitboxRig => false;
 
 	protected override MovementInput BuildMovementInput(float dt)
 	{
@@ -324,8 +337,6 @@ public partial class LocalPlayer : NetworkPlayer
 		Audio.PlayLand(hiddenPos, warmMat, 0f, false);
 	}
 
-	/// <summary>Per-tick weapon audio (shoot, dry-fire, reload) on fire-state edges.
-	/// Replay-gated so reconciliation doesn't re-trigger sounds.</summary>
 	protected override void HandleWeaponAudio()
 	{
 		if (_isReplaying) return;
@@ -379,6 +390,7 @@ public partial class LocalPlayer : NetworkPlayer
 		}
 	}
 
+	/// <summary>Renders the interpolated local view each frame and finishes the world-load fade-out once preloads complete.</summary>
 	public override void _Process(double delta)
 	{
 		if (Engine.IsEditorHint()) { RenderLocalView(delta); return; }
@@ -396,6 +408,7 @@ public partial class LocalPlayer : NetworkPlayer
 		RenderLocalView(delta);
 	}
 
+	/// <summary>Routes input to look and toggles, and records fire timing plus subtick events.</summary>
 	public override void _Input(InputEvent @event)
 	{
 		if (Engine.IsEditorHint()) return;
@@ -407,9 +420,7 @@ public partial class LocalPlayer : NetworkPlayer
 			RecordSubtickInputEvent();
 	}
 
-	/// <summary>Called per snapshot. Compares server position at the acked tick against the stored
-	/// prediction: small drift bleeds out smoothly, large drift triggers a full replay with a visual
-	/// smoothing offset.</summary>
+	/// <summary>Reconciles prediction against the server snapshot at the acked tick: small drift bleeds out, large drift replays.</summary>
 	public void ApplyServerCorrection(uint ackedTick, Vector3 serverPos, Vector3 serverVel)
 	{
 		if (!IsLocalPlayer || ackedTick == 0u) return;

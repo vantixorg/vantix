@@ -1,23 +1,44 @@
 #[compute]
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #version 450
 
-// Post-process compute pass for the PostProcessEffect CompositorEffect.
-// mode 0 -> point-copy the colour buffer into a temp image.
-// mode 1 -> chromatic aberration + motion blur + sharpening + vignette + grain.
 layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 
-// binding 0: source colour, linear-sampled.  pass 0 = scene buffer, pass 1 = temp.
 layout(set = 0, binding = 0) uniform sampler2D src_color;
-// binding 1: destination storage image.      pass 0 = temp, pass 1 = scene buffer.
 layout(rgba16f, set = 0, binding = 1) uniform writeonly image2D dst_image;
 layout(set = 0, binding = 2) uniform sampler2D depth_tex;
 layout(set = 0, binding = 3) uniform sampler2D velocity_tex;
+layout(set = 0, binding = 4, std430) buffer EyeAdapt {
+	float adapted;
+	float enable;
+	float key;
+	float min_exp;
+	float max_exp;
+	float speed_light;
+	float speed_dark;
+	float dt;
+} adapt;
 
-// Trailing _pad0..2 round the block up to the 128-byte push-constant size.
 layout(push_constant, std430) uniform Params {
 	mat4 inv_view_proj;
 	vec3 camera_pos;
-	float motion_blur;       // screen-space velocity multiplier (0 = off)
+	float motion_blur;
 	vec2 raster_size;
 	float aberration;
 	float sharpen;
@@ -26,10 +47,12 @@ layout(push_constant, std430) uniform Params {
 	float mode;
 	float vignette_strength;
 	float vignette_radius;
-	float _pad0;
-	float _pad1;
-	float _pad2;
+	float purkinje_strength;
+	float bands_coverage;
+	float bands_softness;
 } p;
+
+shared float s_lum[256];
 
 vec3 load_uv(vec2 uv) {
 	return texture(src_color, uv).rgb;
@@ -39,12 +62,10 @@ float hash12(vec2 v) {
 	return fract(sin(dot(v, vec2(127.1, 311.7))) * 43758.5453);
 }
 
-// Interleaved gradient noise - smooth screen-space dither (Jimenez, CoD-style).
 float ign(vec2 q) {
 	return fract(52.9829189 * fract(dot(q, vec2(0.06711056, 0.00583715))));
 }
 
-// Smooth value noise (Perlin-ish) - used by heat haze and the AAA grain pass.
 float vnoise(vec2 v) {
 	vec2 i = floor(v);
 	vec2 f = fract(v);
@@ -55,9 +76,7 @@ float vnoise(vec2 v) {
 		f.y);
 }
 
-// Two-octave value noise in pixel space, per-channel chroma, midtone-biased,
-// 14 Hz time-step. Mirror of post_canvas.gdshader.
-vec3 grain_aaa(vec3 col, vec2 px_coord, float t, float strength) {
+vec3 film_grain(vec3 col, vec2 px_coord, float t, float strength) {
 	float gt = floor(t * 14.0);
 	float gtf = fract(t * 14.0);
 	vec2 sf = px_coord / 1.5;
@@ -80,24 +99,45 @@ vec3 grain_aaa(vec3 col, vec2 px_coord, float t, float strength) {
 
 void main() {
 	ivec2 coord = ivec2(gl_GlobalInvocationID.xy);
+	int m = int(p.mode + 0.5);
+
+	if (m == 2) {
+		uint idx = gl_LocalInvocationIndex;
+		vec2 guv = (vec2(gl_LocalInvocationID.xy) + 0.5) / 16.0;
+		vec3 c = texture(src_color, guv).rgb;
+		s_lum[idx] = clamp(dot(c, vec3(0.2126, 0.7152, 0.0722)), 0.0, 8.0);
+		barrier();
+		for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+			if (idx < stride) {
+				s_lum[idx] += s_lum[idx + stride];
+			}
+			barrier();
+		}
+		if (idx == 0u) {
+			float target = max(s_lum[0] / 256.0, 1e-3);
+			float prev = adapt.adapted;
+			float speed = (target > prev) ? adapt.speed_light : adapt.speed_dark;
+			float k = 1.0 - exp(-adapt.dt * max(speed, 0.0));
+			adapt.adapted = prev + (target - prev) * k;
+		}
+		return;
+	}
+
 	if (coord.x >= int(p.raster_size.x) || coord.y >= int(p.raster_size.y)) {
 		return;
 	}
 
-	// Pass 0: plain point copy (colour buffer -> temp).
-	if (p.mode < 0.5) {
+	if (m == 0) {
 		imageStore(dst_image, coord, texelFetch(src_color, coord, 0));
 		return;
 	}
 
-	// Pass 1: effects (temp -> colour buffer).
 	vec2 puv = (vec2(coord) + 0.5) / p.raster_size;
 	vec4 src = texture(src_color, puv);
 	vec2 uv = puv;
 
-	// --- Chromatic aberration: edge-weighted spectral fringe ---
 	vec2 cdir = uv - vec2(0.5);
-	vec2 ca = cdir * length(cdir) * p.aberration;   // r^2 edge weighting
+	vec2 ca = cdir * length(cdir) * p.aberration;
 	vec3 col;
 	if (p.aberration > 0.0) {
 		vec3 csum = vec3(0.0);
@@ -106,9 +146,9 @@ void main() {
 		for (int i = 0; i < CA_N; i++) {
 			float t = float(i) / float(CA_N - 1);
 			vec3 cw = vec3(
-				clamp(1.0 - t * 2.0, 0.0, 1.0),       // red   -> outward side
-				1.0 - abs(t - 0.5) * 2.0,             // green -> centre
-				clamp(t * 2.0 - 1.0, 0.0, 1.0));      // blue  -> inward side
+				clamp(1.0 - t * 2.0, 0.0, 1.0),
+				1.0 - abs(t - 0.5) * 2.0,
+				clamp(t * 2.0 - 1.0, 0.0, 1.0));
 			csum += load_uv(uv + mix(ca, -ca, t)) * cw;
 			wsum += cw;
 		}
@@ -117,16 +157,15 @@ void main() {
 		col = load_uv(uv);
 	}
 
-	// --- Motion blur: reconstruction-style smear along the screen velocity ---
 	if (p.motion_blur > 0.0) {
 		vec2 vel = texture(velocity_tex, uv).rg * p.motion_blur;
 		float vlen = length(vel);
 		if (vlen > 0.12) {
-			vel *= 0.12 / vlen;  // clamp smear length - avoids huge streaks
+			vel *= 0.12 / vlen;
 		}
-		if (vlen > 0.0008) {  // skip effectively-static pixels
+		if (vlen > 0.0008) {
 			const int MB_TAPS = 8;
-			float jitter = ign(vec2(coord)) - 0.5;  // smooth dither, no banding
+			float jitter = ign(vec2(coord)) - 0.5;
 			vec3 acc = vec3(0.0);
 			float msum = 0.0;
 			for (int i = 0; i < MB_TAPS; i++) {
@@ -141,8 +180,10 @@ void main() {
 		}
 	}
 
-	// --- Sharpening: luma-only unsharp mask from 4 neighbours ---
-	// Luma-only keeps it achromatic; the ±0.5 clamp bounds the HDR overshoot.
+	if (adapt.enable > 0.5) {
+		col *= clamp(adapt.key / max(adapt.adapted, 1e-4), adapt.min_exp, adapt.max_exp);
+	}
+
 	if (p.sharpen > 0.0) {
 		vec2 px = 1.0 / p.raster_size;
 		vec3 blur4 = load_uv(uv + vec2(px.x, 0.0)) + load_uv(uv - vec2(px.x, 0.0))
@@ -152,13 +193,24 @@ void main() {
 		col += vec3(clamp(hp, -0.5, 0.5));
 	}
 
-	// --- Vignette ---
 	float vig = 1.0 - smoothstep(p.vignette_radius * 0.4, p.vignette_radius, length(puv - vec2(0.5)));
 	col *= mix(1.0, vig, p.vignette_strength);
 
-	// --- Film grain (AAA) ---
 	if (p.grain_strength > 0.0) {
-		col = grain_aaa(col, vec2(coord) + 0.5, p.time, p.grain_strength);
+		col = film_grain(col, vec2(coord) + 0.5, p.time, p.grain_strength);
+	}
+
+	if (p.purkinje_strength > 0.0) {
+		float l = dot(col, vec3(0.2126, 0.7152, 0.0722));
+		float dark = 1.0 - smoothstep(0.0, 0.2, l);
+		vec3 scotopic = vec3(l) * vec3(0.7, 0.9, 1.4);
+		col = mix(col, scotopic, dark * p.purkinje_strength);
+	}
+
+	if (p.bands_coverage > 0.0) {
+		float bar = p.bands_coverage * 0.5;
+		float s = max(p.bands_softness, 1e-4);
+		col *= smoothstep(bar - s, bar + s, puv.y) * smoothstep(bar - s, bar + s, 1.0 - puv.y);
 	}
 
 	imageStore(dst_image, coord, vec4(max(col, vec3(0.0)), src.a));

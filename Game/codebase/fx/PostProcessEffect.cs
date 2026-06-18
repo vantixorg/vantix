@@ -1,33 +1,30 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 
 namespace Vantix.Fx;
 
-/// <summary>
-/// Post-transparency CompositorEffect doing chromatic aberration, sharpening, vignette, film grain and
-/// motion blur in one compute pass. Hooked via the WorldEnvironment compositor (compositor.tres).
-/// Requires a non-multisampled color buffer (TAA, not MSAA).
-/// </summary>
+/// <summary>Post-process compositor pass: chromatic aberration, sharpen, vignette, film grain and motion blur
+/// in one compute shader over the resolved colour. Needs TAA (not MSAA).</summary>
 [Tool]
 [GlobalClass]
 public partial class PostProcessEffect : CompositorEffect
 {
-	[Export] public bool ChromaticAberration = true;
-	[Export] public bool Sharpening = true;
-	[Export] public bool Vignette = true;
-	[Export] public bool FilmGrain = true;
-	[Export] public bool MotionBlur = true;
-	[Export(PropertyHint.Enum, "Simple,FilmGrain,FilmGrain2")] public int GrainMode = 1;
-
-	[Export(PropertyHint.Range, "0.0,0.02,0.0001")] public float Aberration = 0.0026f;
-	[Export(PropertyHint.Range, "0.0,2.0,0.01")] public float Sharpen = 0.25f;
-	[Export(PropertyHint.Range, "0.0,1.0,0.01")] public float VignetteStrength = 0.18f;
-	[Export(PropertyHint.Range, "0.2,1.5,0.01")] public float VignetteRadius = 1.05f;
-	[Export(PropertyHint.Range, "0.0,0.5,0.01")] public float VignetteAdsBoost = 0.15f;
-	/// <summary>Runtime value driven by LocalAnimation: 0 = no ADS, 1 = full ADS boost.</summary>
-	public float AdsBlend = 0f;
-	[Export(PropertyHint.Range, "0.0,0.5,0.005")] public float GrainStrength = 0.085f;
-	[Export(PropertyHint.Range, "0.0,8.0,0.1")] public float MotionBlurStrength = 3.0f;
-
 	private RenderingDevice _rd;
 	private Rid _shader;
 	private Rid _pipeline;
@@ -38,10 +35,16 @@ public partial class PostProcessEffect : CompositorEffect
 	private RDUniform _dstUniform;
 	private RDUniform _depthUniform;
 	private RDUniform _velocityUniform;
+	private RDUniform _adaptUniform;
+	private Rid _adaptBuffer;
 	private Godot.Collections.Array<RDUniform> _uniformList;
 	private readonly float[] _pushFloats = new float[32];
 	private readonly byte[] _pushBytes1 = new byte[32 * sizeof(float)];
 	private readonly byte[] _pushBytes2 = new byte[32 * sizeof(float)];
+	private readonly byte[] _pushBytesMeter = new byte[32 * sizeof(float)];
+	private readonly float[] _adaptParamFloats = new float[7];
+	private readonly byte[] _adaptParamBytes = new byte[7 * sizeof(float)];
+	private ulong _lastFrameUsec;
 
 	private readonly System.Collections.Generic.Dictionary<ulong, bool> _storageCheckCache
 		= new System.Collections.Generic.Dictionary<ulong, bool>(4);
@@ -53,24 +56,63 @@ public partial class PostProcessEffect : CompositorEffect
 	private int _firstRenderLogged;
 	private int _mbDiagLogged;
 
+	/// <summary>True when at least one sub-effect contributes; lets _RenderCallback skip the dispatch when all are off.</summary>
+	private bool AnyEffectActive =>
+		(ChromaticAberration && Aberration > 0f) ||
+		(Sharpening && Sharpen > 0f) ||
+		(FilmGrain && GrainStrength > 0f) ||
+		(Vignette && (VignetteStrength + VignetteAdsBoost * AdsBlend) > 0f) ||
+		(MotionBlur && MotionBlurStrength > 0f) ||
+		EyeAdaptation ||
+		(Purkinje && PurkinjeStrength > 0f) ||
+		(CinematicBands && BandsCoverage > 0f);
+
+	[ExportGroup("Chromatic Aberration")]
+	[Export] public bool ChromaticAberration = true;
+	[Export(PropertyHint.Range, "0.0,0.02,0.0001")] public float Aberration = 0.0026f;
+
+	[ExportGroup("Sharpening")]
+	[Export] public bool Sharpening = true;
+	[Export(PropertyHint.Range, "0.0,2.0,0.01")] public float Sharpen = 0.25f;
+
+	[ExportGroup("Vignette")]
+	[Export] public bool Vignette = true;
+	[Export(PropertyHint.Range, "0.0,1.0,0.01")] public float VignetteStrength = 0.18f;
+	[Export(PropertyHint.Range, "0.2,1.5,0.01")] public float VignetteRadius = 1.05f;
+	[Export(PropertyHint.Range, "0.0,0.5,0.01")] public float VignetteAdsBoost = 0.15f;
+	/// <summary>Runtime value driven by LocalAnimation: 0 = no ADS, 1 = full ADS boost.</summary>
+	public float AdsBlend = 0f;
+
+	[ExportGroup("Film Grain")]
+	[Export] public bool FilmGrain = true;
+	[Export(PropertyHint.Enum, "Simple,FilmGrain,FilmGrain2")] public int GrainMode = 1;
+	[Export(PropertyHint.Range, "0.0,0.5,0.005")] public float GrainStrength = 0.085f;
+
+	[ExportGroup("Motion Blur")]
+	[Export] public bool MotionBlur = true;
+	[Export(PropertyHint.Range, "0.0,8.0,0.1")] public float MotionBlurStrength = 3.0f;
+
+	[ExportGroup("Eye Adaptation")]
+	[Export] public bool EyeAdaptation = false;
+	[Export(PropertyHint.Range, "0.01,2.0,0.005")] public float EyeAdaptKey = 0.18f;
+	[Export(PropertyHint.Range, "0.01,4.0,0.01")] public float EyeAdaptMinExposure = 0.25f;
+	[Export(PropertyHint.Range, "0.1,16.0,0.1")] public float EyeAdaptMaxExposure = 4.0f;
+	[Export(PropertyHint.Range, "0.1,10.0,0.1")] public float EyeAdaptSpeedLight = 2.5f;
+	[Export(PropertyHint.Range, "0.1,10.0,0.1")] public float EyeAdaptSpeedDark = 0.8f;
+
+	[ExportGroup("Purkinje")]
+	[Export] public bool Purkinje = false;
+	[Export(PropertyHint.Range, "0.0,1.0,0.01")] public float PurkinjeStrength = 0.5f;
+
+	[ExportGroup("Cinematic Bands")]
+	[Export] public bool CinematicBands = false;
+	[Export(PropertyHint.Range, "0.0,0.5,0.005")] public float BandsCoverage = 0.18f;
+	[Export(PropertyHint.Range, "0.0,0.05,0.001")] public float BandsSoftness = 0.004f;
 
 	/// <summary>True under the dummy renderer (--headless / dedicated server), where no RenderingDevice exists.</summary>
 	private static bool IsHeadless() =>
 		OS.HasFeature("dedicated_server") || DisplayServer.GetName() == "headless";
 
-	/// <summary>Sets the callback slot, requests render targets, and queues compute init.</summary>
-	public PostProcessEffect()
-	{
-		EffectCallbackType = EffectCallbackTypeEnum.PostTransparent;
-		AccessResolvedColor = true;
-		AccessResolvedDepth = true;
-		NeedsMotionVectors = true;
-		if (!Engine.IsEditorHint() && !IsHeadless())
-		{
-			GD.Print("[PostProcessFX] ctor — queueing InitializeCompute on render thread");
-			RenderingServer.CallOnRenderThread(Callable.From(InitializeCompute));
-		}
-	}
 	/// <summary>Loads the compute shader and creates the pipeline and samplers on the render thread.</summary>
 	private void InitializeCompute()
 	{
@@ -80,7 +122,7 @@ public partial class PostProcessEffect : CompositorEffect
 			GD.PrintErr("[PostProcessFX] InitializeCompute: RenderingServer.GetRenderingDevice() returned null — local RD unavailable, post-pass will NOT run");
 			return;
 		}
-		var shaderFile = GD.Load<RDShaderFile>("res://maps/dust/post_process.glsl");
+		var shaderFile = GD.Load<RDShaderFile>("res://shaders/post_process.glsl");
 		if (shaderFile == null)
 		{
 			GD.PrintErr("[PostProcessFX] post_process.glsl could not be loaded — file likely missing from export. Check export_presets.cfg include filters for *.glsl");
@@ -109,13 +151,153 @@ public partial class PostProcessEffect : CompositorEffect
 			RepeatV = RenderingDevice.SamplerRepeatMode.ClampToEdge,
 		});
 
+		var adaptInit = new float[8];
+		adaptInit[0] = 0.5f;
+		var adaptInitBytes = new byte[8 * sizeof(float)];
+		System.Buffer.BlockCopy(adaptInit, 0, adaptInitBytes, 0, adaptInitBytes.Length);
+		_adaptBuffer = _rd.StorageBufferCreate((uint)adaptInitBytes.Length, adaptInitBytes);
+
 		_srcUniform = new RDUniform { UniformType = RenderingDevice.UniformType.SamplerWithTexture, Binding = 0 };
 		_dstUniform = new RDUniform { UniformType = RenderingDevice.UniformType.Image, Binding = 1 };
 		_depthUniform = new RDUniform { UniformType = RenderingDevice.UniformType.SamplerWithTexture, Binding = 2 };
 		_velocityUniform = new RDUniform { UniformType = RenderingDevice.UniformType.SamplerWithTexture, Binding = 3 };
-		_uniformList = new Godot.Collections.Array<RDUniform> { _srcUniform, _dstUniform, _depthUniform, _velocityUniform };
+		_adaptUniform = new RDUniform { UniformType = RenderingDevice.UniformType.StorageBuffer, Binding = 4 };
+		_uniformList = new Godot.Collections.Array<RDUniform> { _srcUniform, _dstUniform, _depthUniform, _velocityUniform, _adaptUniform };
 	}
 
+	/// <summary>Dispatches both passes (mode 0 colour->temp, mode 1 temp->colour) in one ComputeList with a barrier
+	/// between. Each pass uses its own push-constant byte buffer so the command list captures the right snapshot.</summary>
+	private void RunBothPasses(Rid color, Rid temp, Rid depth, Rid velocity, Projection invViewProj,
+		Vector3 camPos, Vector2I size, uint xGroups, uint yGroups, float time, float motionBlur, float dt)
+	{
+		_pushFloats[0] = invViewProj.X.X;
+		_pushFloats[1] = invViewProj.X.Y;
+		_pushFloats[2] = invViewProj.X.Z;
+		_pushFloats[3] = invViewProj.X.W;
+		_pushFloats[4] = invViewProj.Y.X;
+		_pushFloats[5] = invViewProj.Y.Y;
+		_pushFloats[6] = invViewProj.Y.Z;
+		_pushFloats[7] = invViewProj.Y.W;
+		_pushFloats[8] = invViewProj.Z.X;
+		_pushFloats[9] = invViewProj.Z.Y;
+		_pushFloats[10] = invViewProj.Z.Z;
+		_pushFloats[11] = invViewProj.Z.W;
+		_pushFloats[12] = invViewProj.W.X;
+		_pushFloats[13] = invViewProj.W.Y;
+		_pushFloats[14] = invViewProj.W.Z;
+		_pushFloats[15] = invViewProj.W.W;
+		_pushFloats[16] = camPos.X;
+		_pushFloats[17] = camPos.Y;
+		_pushFloats[18] = camPos.Z;
+		_pushFloats[20] = size.X;
+		_pushFloats[21] = size.Y;
+		_pushFloats[22] = ChromaticAberration ? Aberration : 0.0f;
+		_pushFloats[23] = Sharpening ? Sharpen : 0.0f;
+		_pushFloats[24] = FilmGrain ? GrainStrength : 0.0f;
+		_pushFloats[25] = time;
+		_pushFloats[27] = Vignette ? (VignetteStrength + VignetteAdsBoost * AdsBlend) : 0.0f;
+		_pushFloats[28] = VignetteRadius;
+		_pushFloats[29] = Purkinje ? PurkinjeStrength : 0.0f;
+		_pushFloats[30] = CinematicBands ? BandsCoverage : 0.0f;
+		_pushFloats[31] = BandsSoftness;
+
+		_pushFloats[19] = 0.0f;
+		_pushFloats[26] = 2.0f;
+		System.Buffer.BlockCopy(_pushFloats, 0, _pushBytesMeter, 0, _pushBytesMeter.Length);
+
+		_pushFloats[19] = 0.0f;
+		_pushFloats[26] = 0.0f;
+		System.Buffer.BlockCopy(_pushFloats, 0, _pushBytes1, 0, _pushBytes1.Length);
+
+		Rid set1 = GetOrCreateSet(color, temp, depth, velocity);
+		if (!set1.IsValid)
+			return;
+
+		_pushFloats[19] = motionBlur;
+		_pushFloats[26] = 1.0f + GrainMode;
+		System.Buffer.BlockCopy(_pushFloats, 0, _pushBytes2, 0, _pushBytes2.Length);
+
+		Rid set2 = GetOrCreateSet(temp, color, depth, velocity);
+		if (!set2.IsValid)
+			return;
+
+		_adaptParamFloats[0] = EyeAdaptation ? 1.0f : 0.0f;
+		_adaptParamFloats[1] = EyeAdaptKey;
+		_adaptParamFloats[2] = EyeAdaptMinExposure;
+		_adaptParamFloats[3] = EyeAdaptMaxExposure;
+		_adaptParamFloats[4] = EyeAdaptSpeedLight;
+		_adaptParamFloats[5] = EyeAdaptSpeedDark;
+		_adaptParamFloats[6] = dt;
+		System.Buffer.BlockCopy(_adaptParamFloats, 0, _adaptParamBytes, 0, _adaptParamBytes.Length);
+		_rd.BufferUpdate(_adaptBuffer, sizeof(float), (uint)_adaptParamBytes.Length, _adaptParamBytes);
+
+		long list = _rd.ComputeListBegin();
+		_rd.ComputeListBindComputePipeline(list, _pipeline);
+
+		if (EyeAdaptation)
+		{
+			_rd.ComputeListBindUniformSet(list, set1, 0);
+			_rd.ComputeListSetPushConstant(list, _pushBytesMeter, (uint)_pushBytesMeter.Length);
+			_rd.ComputeListDispatch(list, 1, 1, 1);
+			_rd.ComputeListAddBarrier(list);
+		}
+
+		_rd.ComputeListBindUniformSet(list, set1, 0);
+		_rd.ComputeListSetPushConstant(list, _pushBytes1, (uint)_pushBytes1.Length);
+		_rd.ComputeListDispatch(list, xGroups, yGroups, 1);
+
+		_rd.ComputeListAddBarrier(list);
+
+		_rd.ComputeListBindUniformSet(list, set2, 0);
+		_rd.ComputeListSetPushConstant(list, _pushBytes2, (uint)_pushBytes2.Length);
+		_rd.ComputeListDispatch(list, xGroups, yGroups, 1);
+
+		_rd.ComputeListEnd();
+	}
+
+	/// <summary>Returns the cached UniformSet for the (src, dst) pair, creating one on first use. Stale entries are dropped and rebuilt.</summary>
+	private Rid GetOrCreateSet(Rid src, Rid dst, Rid depth, Rid velocity)
+	{
+		var key = (src.Id, dst.Id);
+		if (_setCache.TryGetValue(key, out var cached))
+		{
+			if (_rd.UniformSetIsValid(cached))
+				return cached;
+			_setCache.Remove(key);
+		}
+
+		_srcUniform.ClearIds();
+		_srcUniform.AddId(_linearSampler);
+		_srcUniform.AddId(src);
+		_dstUniform.ClearIds();
+		_dstUniform.AddId(dst);
+		_depthUniform.ClearIds();
+		_depthUniform.AddId(_sampler);
+		_depthUniform.AddId(depth);
+		_velocityUniform.ClearIds();
+		_velocityUniform.AddId(_sampler);
+		_velocityUniform.AddId(velocity);
+		_adaptUniform.ClearIds();
+		_adaptUniform.AddId(_adaptBuffer);
+
+		Rid fresh = _rd.UniformSetCreate(_uniformList, _shader, 0);
+		_setCache[key] = fresh;
+		return fresh;
+	}
+
+	/// <summary>Sets the callback slot, requests render targets, and queues compute init.</summary>
+	public PostProcessEffect()
+	{
+		EffectCallbackType = EffectCallbackTypeEnum.PostTransparent;
+		AccessResolvedColor = true;
+		AccessResolvedDepth = true;
+		NeedsMotionVectors = true;
+		if (!IsHeadless())
+		{
+			GD.Print("[PostProcessFX] ctor — queueing InitializeCompute on render thread");
+			RenderingServer.CallOnRenderThread(Callable.From(InitializeCompute));
+		}
+	}
 
 	/// <summary>Frees GPU resources (shader, pipeline, samplers) on predelete.</summary>
 	public override void _Notification(int what)
@@ -130,16 +312,10 @@ public partial class PostProcessEffect : CompositorEffect
 				_rd.FreeRid(_sampler);
 			if (_linearSampler.IsValid)
 				_rd.FreeRid(_linearSampler);
+			if (_adaptBuffer.IsValid)
+				_rd.FreeRid(_adaptBuffer);
 		}
 	}
-
-	/// <summary>True when at least one sub-effect contributes; lets _RenderCallback skip the dispatch when all are off.</summary>
-	private bool AnyEffectActive =>
-		(ChromaticAberration && Aberration > 0f) ||
-		(Sharpening && Sharpen > 0f) ||
-		(FilmGrain && GrainStrength > 0f) ||
-		(Vignette && (VignetteStrength + VignetteAdsBoost * AdsBlend) > 0f) ||
-		(MotionBlur && MotionBlurStrength > 0f);
 
 	/// <summary>Per-view entry: copies scene colour to a temp buffer, then runs the effects pass back to colour.</summary>
 	public override void _RenderCallback(int effectCallbackType, RenderData renderData)
@@ -166,6 +342,9 @@ public partial class PostProcessEffect : CompositorEffect
 		uint xGroups = ((uint)size.X + 15) / 16;
 		uint yGroups = ((uint)size.Y + 15) / 16;
 		float time = (Time.GetTicksMsec() % 100000UL) / 1000.0f;
+		ulong nowUsec = Time.GetTicksUsec();
+		float dt = _lastFrameUsec == 0UL ? 0.0f : Mathf.Clamp((nowUsec - _lastFrameUsec) / 1_000_000.0f, 0.0f, 0.1f);
+		_lastFrameUsec = nowUsec;
 		uint views = buffers.GetViewCount();
 		Vector3 camPos = sceneData.GetCamTransform().Origin;
 
@@ -205,100 +384,7 @@ public partial class PostProcessEffect : CompositorEffect
 			Projection viewMatrix = new Projection(sceneData.GetCamTransform().AffineInverse());
 			Projection invViewProj = (sceneData.GetViewProjection(view) * viewMatrix).Inverse();
 
-			RunBothPasses(color, temp, depth, velocity, invViewProj, camPos, size, xGroups, yGroups, time, motionBlur);
+			RunBothPasses(color, temp, depth, velocity, invViewProj, camPos, size, xGroups, yGroups, time, motionBlur, dt);
 		}
-	}
-
-	/// <summary>Dispatches both passes (mode 0 colour->temp, mode 1 temp->colour) in one ComputeList with a barrier
-	/// between. Each pass uses its own push-constant byte buffer so the command list captures the right snapshot.</summary>
-	private void RunBothPasses(Rid color, Rid temp, Rid depth, Rid velocity, Projection invViewProj,
-		Vector3 camPos, Vector2I size, uint xGroups, uint yGroups, float time, float motionBlur)
-	{
-		_pushFloats[0] = invViewProj.X.X;
-		_pushFloats[1] = invViewProj.X.Y;
-		_pushFloats[2] = invViewProj.X.Z;
-		_pushFloats[3] = invViewProj.X.W;
-		_pushFloats[4] = invViewProj.Y.X;
-		_pushFloats[5] = invViewProj.Y.Y;
-		_pushFloats[6] = invViewProj.Y.Z;
-		_pushFloats[7] = invViewProj.Y.W;
-		_pushFloats[8] = invViewProj.Z.X;
-		_pushFloats[9] = invViewProj.Z.Y;
-		_pushFloats[10] = invViewProj.Z.Z;
-		_pushFloats[11] = invViewProj.Z.W;
-		_pushFloats[12] = invViewProj.W.X;
-		_pushFloats[13] = invViewProj.W.Y;
-		_pushFloats[14] = invViewProj.W.Z;
-		_pushFloats[15] = invViewProj.W.W;
-		_pushFloats[16] = camPos.X;
-		_pushFloats[17] = camPos.Y;
-		_pushFloats[18] = camPos.Z;
-		_pushFloats[20] = size.X;
-		_pushFloats[21] = size.Y;
-		_pushFloats[22] = ChromaticAberration ? Aberration : 0.0f;
-		_pushFloats[23] = Sharpening ? Sharpen : 0.0f;
-		_pushFloats[24] = FilmGrain ? GrainStrength : 0.0f;
-		_pushFloats[25] = time;
-		_pushFloats[27] = Vignette ? (VignetteStrength + VignetteAdsBoost * AdsBlend) : 0.0f;
-		_pushFloats[28] = VignetteRadius;
-
-		_pushFloats[19] = 0.0f;
-		_pushFloats[26] = 0.0f;
-		System.Buffer.BlockCopy(_pushFloats, 0, _pushBytes1, 0, _pushBytes1.Length);
-
-		Rid set1 = GetOrCreateSet(color, temp, depth, velocity);
-		if (!set1.IsValid)
-			return;
-
-		_pushFloats[19] = motionBlur;
-		_pushFloats[26] = 1.0f + GrainMode;
-		System.Buffer.BlockCopy(_pushFloats, 0, _pushBytes2, 0, _pushBytes2.Length);
-
-		Rid set2 = GetOrCreateSet(temp, color, depth, velocity);
-		if (!set2.IsValid)
-			return;
-
-		long list = _rd.ComputeListBegin();
-		_rd.ComputeListBindComputePipeline(list, _pipeline);
-
-		_rd.ComputeListBindUniformSet(list, set1, 0);
-		_rd.ComputeListSetPushConstant(list, _pushBytes1, (uint)_pushBytes1.Length);
-		_rd.ComputeListDispatch(list, xGroups, yGroups, 1);
-
-		_rd.ComputeListAddBarrier(list);
-
-		_rd.ComputeListBindUniformSet(list, set2, 0);
-		_rd.ComputeListSetPushConstant(list, _pushBytes2, (uint)_pushBytes2.Length);
-		_rd.ComputeListDispatch(list, xGroups, yGroups, 1);
-
-		_rd.ComputeListEnd();
-	}
-
-	/// <summary>Returns the cached UniformSet for the (src, dst) pair, creating one on first use. Stale entries are dropped and rebuilt.</summary>
-	private Rid GetOrCreateSet(Rid src, Rid dst, Rid depth, Rid velocity)
-	{
-		var key = (src.Id, dst.Id);
-		if (_setCache.TryGetValue(key, out var cached))
-		{
-			if (_rd.UniformSetIsValid(cached))
-				return cached;
-			_setCache.Remove(key);
-		}
-
-		_srcUniform.ClearIds();
-		_srcUniform.AddId(_linearSampler);
-		_srcUniform.AddId(src);
-		_dstUniform.ClearIds();
-		_dstUniform.AddId(dst);
-		_depthUniform.ClearIds();
-		_depthUniform.AddId(_sampler);
-		_depthUniform.AddId(depth);
-		_velocityUniform.ClearIds();
-		_velocityUniform.AddId(_sampler);
-		_velocityUniform.AddId(velocity);
-
-		Rid fresh = _rd.UniformSetCreate(_uniformList, _shader, 0);
-		_setCache[key] = fresh;
-		return fresh;
 	}
 }

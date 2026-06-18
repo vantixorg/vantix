@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 using System;
 using System.Collections.Generic;
@@ -27,11 +44,12 @@ public partial class SmokeVoxelField : Node3D
 	public float Dissipation = 0.018f;
 	public float SkyFade = 0.3f;
 	public float FadeRate = 1.6f;
-	public float FadeRise = 1.2f;
+	public float FadeRise = 0.3f;
+	public float FadeOutTime = 0.8f;
 	public float MaxDensity = 7f;
 
 	public float DensityMul = 60f;
-	public float EmissionStrength = 0.9f;
+	public float EmissionStrength = 0.5f;
 
 	public float ChannelRadius = 1.0f;
 	public float ChannelDuration = 0.3f;
@@ -58,6 +76,7 @@ uniform vec3 grid_size = vec3(1.0);
 uniform float noise_scale = 0.55;
 uniform float noise_rise = 0.08;
 uniform float noise_amount = 0.5;
+uniform float fade = 1.0;
 
 float hash(vec3 p) {
 	p = fract(p * 0.3183099 + 0.1);
@@ -90,9 +109,10 @@ void fog() {
 	float n = clamp((fbm(np) - 0.30) * 2.4, 0.0, 1.0);   // remap a narrow fbm range to 0..1
 	d *= mix(1.0 - noise_amount, 1.0 + noise_amount, n);
 
-	DENSITY = max(0.0, d) * density_mul;
+	float dens = max(0.0, d) * density_mul * fade;
+	DENSITY = dens;
 	ALBEDO = smoke_albedo;
-	EMISSION = smoke_albedo * emission_strength * d;
+	EMISSION = smoke_albedo * emission_strength * dens;
 }
 ";
 
@@ -115,6 +135,9 @@ void fog() {
 	private int _wallMaxY;
 
 	private ShaderMaterial _mat;
+	private float _fade = 1f;
+	private bool _dying;
+	private float _peakTotal;
 	private ImageTexture3D _tex;
 	private Godot.Collections.Array<Image> _images;
 	private byte[] _sliceBuf;
@@ -179,6 +202,14 @@ void fog() {
 		}
 		if (!_floodDone) { StepFlood(); return; }
 		if (!_built) { BuildVolume(); _built = true; return; }
+
+		if (_dying)
+		{
+			_fade = Mathf.Max(0f, _fade - (float)delta / FadeOutTime);
+			_mat.SetShaderParameter("fade", _fade);
+			if (_fade <= 0f) QueueFree();
+			return;
+		}
 
 		StepSim((float)delta);
 
@@ -307,9 +338,8 @@ void fog() {
 			return;
 		}
 		if (!env.VolumetricFogEnabled) env.VolumetricFogEnabled = true;
-		if (env.VolumetricFogAmbientInject < 1f) env.VolumetricFogAmbientInject = 1f;
 		env.VolumetricFogTemporalReprojectionEnabled = true;
-		env.VolumetricFogTemporalReprojectionAmount = 0.9f;
+		env.VolumetricFogTemporalReprojectionAmount = 0.85f;
 	}
 
 	/// <summary>Runs one deterministic advection + diffusion + dissipation step on the density grid.</summary>
@@ -426,7 +456,6 @@ void fog() {
 	{
 		float total = 0f;
 		int layer = _nx * _ny;
-		float maskBlend = Mathf.Clamp(_age - BurnTime, 0f, 1f);
 
 		for (int z = 0; z < _nz; z++)
 		{
@@ -434,7 +463,7 @@ void fog() {
 				for (int x = 0; x < _nx; x++)
 				{
 					int i = z * layer + y * _nx + x;
-					float d = _density[i] * Mathf.Lerp(_shapeMask[i], 1f, maskBlend);
+					float d = _density[i] * _shapeMask[i];
 					_sliceBuf[x + y * _nx] = (byte)(Mathf.Clamp(d, 0f, 1f) * 255f);
 					total += d;
 				}
@@ -442,7 +471,8 @@ void fog() {
 		}
 		_tex.Update(_images);
 
-		if (total < 0.5f && _age > BurnTime) { Dbg.Print("[smoke] dissolved — freeing"); QueueFree(); }
+		_peakTotal = Mathf.Max(_peakTotal, total);
+		if (!_dying && _age > BurnTime && total < _peakTotal * 0.25f) _dying = true;
 	}
 
 	/// <summary>Marks the shot line for clearing — the sim deterministically empties and refills the channel.</summary>

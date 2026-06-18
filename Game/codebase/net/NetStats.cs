@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 
 namespace Vantix.Net;
@@ -18,6 +35,9 @@ public static class NetStats
 	public static uint ClientTick;
 	public static uint ServerTickEstimate;
 	public static int InterpDelayMs;
+	/// <summary>Last lag-comp rewind distance the server applied for this client's shot (ticks = RTT/2 + reported
+	/// interp, capped at sv_max_unlag_ticks). Listen/debug only; mirrors how far hitscan rewound opponents.</summary>
+	public static int LagCompRewindTicks;
 
 	public static int PeerCount;
 	public static int MaxPlayers;
@@ -56,6 +76,7 @@ public static class NetStats
 		ServerTick = 0u;
 		PeerCount = 0;
 		InterpDelayMs = 100;
+		LagCompRewindTicks = 0;
 		LastReconcileDriftM = 0f;
 		ReconcilesPerSec = 0;
 		LastReconcileTimeSec = 0.0;

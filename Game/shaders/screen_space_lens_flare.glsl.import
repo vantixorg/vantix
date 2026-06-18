@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://cpu8o1l3klw4p"
+path="res://.godot/imported/screen_space_lens_flare.glsl-50fcccb739cbc6495c34e1420054a4d2.res"
+
+[deps]
+
+source_file="res://shaders/screen_space_lens_flare.glsl"
+dest_files=["res://.godot/imported/screen_space_lens_flare.glsl-50fcccb739cbc6495c34e1420054a4d2.res"]
+
+[params]
+

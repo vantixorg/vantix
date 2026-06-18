@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 
 namespace Vantix.Debug;
@@ -202,7 +219,7 @@ public partial class NetGraphOverlay : Node
 		Set(0, 2, $"up {upPktPerSec:F0}/s");
 
 		Set(1, 0, $"tick {tickRate:F0}");
-		Set(1, 1, "choke 0%");
+		Set(1, 1, $"interp {NetStats.InterpDelayMs}ms");
 		Set(1, 2, $"cmd {cmdPktPerSec:F0}/s");
 
 		Set(2, 0, $"in {downKBs:F1}KB/s");
@@ -219,7 +236,9 @@ public partial class NetGraphOverlay : Node
 		else if (severity < 30f && rps < 10)      reconcileCol = new Color(1f, 0.95f, 0.55f);
 		else                                      reconcileCol = new Color(1f, 0.4f, 0.4f);
 		if (sinceLast < 0.3) reconcileCol = reconcileCol.Lerp(new Color(1f, 1f, 1f), 0.5f);
-		_reconcileLabel.Text = $"reconcile H{driftHorizCm:F1} V{driftVertCm:F1}cm  {rps}/s";
+		string reconcileText = $"reconcile H{driftHorizCm:F1} V{driftVertCm:F1}cm  {rps}/s";
+		if (NetStats.Mode == NetMode.Listen) reconcileText += $"  lagcomp {NetStats.LagCompRewindTicks}t";
+		_reconcileLabel.Text = reconcileText;
 		_reconcileLabel.AddThemeColorOverride("font_color", reconcileCol);
 
 		_downHeader.Text = $"↓Jit {_downJitterMs:F1}ms";

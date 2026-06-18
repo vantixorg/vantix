@@ -1,29 +1,43 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 
 namespace Vantix.Net;
 
-/// <summary>Serialisable FoW PVS data — output of <see cref="VoxelPvsInstance"/>'s editor bake. Ships as a
-/// .tres beside the map .tscn; <see cref="NetServer"/> loads it via <see cref="VoxelPvs.LoadFromData"/> for FoW
-/// from tick 1, no runtime build. Layout: flat <see cref="VisibilityBytes"/> of N² bits (N = <see cref="TotalVoxels"/>);
-/// bit (a×N + b) set = voxel a sees b. Symmetric, so query order doesn't matter.</summary>
+/// <summary>Serialised fog-of-war PVS baked in the editor: a flat bitset of N² bits (N = TotalVoxels) where
+/// bit (a*N + b) means voxel a sees b (symmetric). The server loads it at startup, so FoW works from tick 1.</summary>
 [Tool]
 [GlobalClass]
 public partial class VoxelPvsData : Resource
 {
 	/// <summary>World-space min corner of the grid AABB. World <c>p</c> → voxel <c>floor((p - Origin) / VoxelSize)</c>.</summary>
 	[Export] public Vector3 Origin { get; set; }
-	/// <summary>Cubic voxel edge length (m), as used at bake time (possibly auto-coarsened to fit the budget).</summary>
+	/// <summary>Voxel edge length in metres, set at bake time.</summary>
 	[Export] public float VoxelSize { get; set; } = 4.0f;
 	/// <summary>Cells per axis. Total = X × Y × Z.</summary>
 	[Export] public Vector3I Dims { get; set; }
-	/// <summary>Packed visibility bits. Length = ceil(N² / 8). Bit i = byte[i>>3] & (1 << (i & 7)).</summary>
+	/// <summary>Packed visibility bit.</summary>
 	[Export] public byte[] VisibilityBytes { get; set; }
 
 	public int TotalVoxels => Dims.X * Dims.Y * Dims.Z;
 	public bool HasData => VisibilityBytes != null && VisibilityBytes.Length > 0 && TotalVoxels > 0;
 
-	/// <summary>Per voxel, how many it can see (incl. itself). O(N²) bit-scan (~1s at N=16k) — cache if
-	/// queried repeatedly. Feeds the density-heatmap gizmo.</summary>
+	/// <summary>Per voxel, how many it can see (including itself). O(N²) bit-scan — cache if queried repeatedly.</summary>
 	public int[] ComputePerVoxelVisibleCounts()
 	{
 		if (!HasData) return System.Array.Empty<int>();

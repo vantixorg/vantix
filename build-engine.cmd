@@ -16,10 +16,17 @@ if not exist "%GODOT_SRC%\SConstruct" (
     )
     if not exist "%~dp0EngineSource" mkdir "%~dp0EngineSource"
     echo.
-    echo [setup] Godot source missing - cloning via git, depth=1, branch 4.6.3-stable...
-    git clone --depth 1 --branch 4.6.3-stable https://github.com/godotengine/godot.git "%GODOT_SRC%"
+    echo [setup] Godot source missing - fetching 4.7-rc3 commit 645638d, depth=1...
+    git init "%GODOT_SRC%"
+    git -C "%GODOT_SRC%" remote add origin https://github.com/godotengine/godot.git
+    git -C "%GODOT_SRC%" fetch --depth 1 origin 645638db91769059ed061450e6b348a7033d4225
     if errorlevel 1 (
-        echo [ERR] git clone failed
+        echo [ERR] git fetch failed
+        exit /b 1
+    )
+    git -C "%GODOT_SRC%" checkout --detach FETCH_HEAD
+    if errorlevel 1 (
+        echo [ERR] git checkout failed
         exit /b 1
     )
     echo [setup] EngineSource ready at %GODOT_SRC%
@@ -184,7 +191,7 @@ if not exist "%GODOT_SRC%\bin\GodotSharp\Api" (
 echo.
 echo === GODOT EDITOR BUILD - full, mono, patched ===
 pushd "%GODOT_SRC%"
-python -m SCons platform=windows target=editor production=yes module_mono_enabled=yes
+python -m SCons platform=windows target=editor production=yes module_mono_enabled=yes winrt=no accesskit=no
 set "SCONS_EDITOR_RC=%errorlevel%"
 popd
 
@@ -262,6 +269,7 @@ echo.
 
 pushd "%GODOT_SRC%"
 python -m SCons platform=windows target=template_release production=yes ^
+    winrt=no accesskit=no ^
     module_mono_enabled=yes ^
     module_bullet_enabled=no ^
     module_navigation_2d_enabled=no ^
@@ -281,8 +289,6 @@ python -m SCons platform=windows target=template_release production=yes ^
     module_basis_universal_enabled=no ^
     module_squish_enabled=no ^
     module_gltf_enabled=no ^
-    module_astcenc_enabled=no ^
-    module_etcpak_enabled=no ^
     module_ktx_enabled=no ^
     module_godot_physics_2d_enabled=no ^
     module_godot_physics_3d_enabled=no

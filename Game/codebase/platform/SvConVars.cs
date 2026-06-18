@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using System.Diagnostics.CodeAnalysis;
 
 namespace Vantix.Server;
@@ -159,6 +176,10 @@ public class SvConVars
 
 	/// <summary>Disables lag-comp bone rewind — casts use live hitbox positions. Isolates rewind vs handoff misses.</summary>
 	public bool NoRewind = false;
+
+	/// <summary>Max ticks lag-comp may rewind (RTT/2 + client interp), capped to the bone-history depth (128 = ~1s
+	/// @128Hz). Source's sv_maxunlag analogue; bounds how far a high-ping shooter can rewind opponents.</summary>
+	public int MaxUnlagTicks = 128;
 
 	/// <summary>Server profiler: periodic warnings for [SV] samples over ProfilerThresholdMs.
 	/// In listen mode reads the HUD-flushed snapshot to avoid a double clear.</summary>

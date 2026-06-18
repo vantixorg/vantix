@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 
 namespace Vantix.Character;
@@ -6,10 +23,91 @@ namespace Vantix.Character;
 /// visual hooks. LocalPlayer derives from this and adds the local-only camera, mouse-look, aim guide.</summary>
 public partial class NetworkPlayer : CharacterBody3D
 {
+	private bool _isFrozen;
+	private uint _savedCollisionLayer;
+	private uint _savedCollisionMask;
+
+	private bool _isDead;
+	private uint _savedCollisionLayerDead;
+	private uint _savedCollisionMaskDead;
+
+	private const float MantleMinHeight = 1.0f;
+	private const float MantleMaxHeight = 1.75f;
+	private const float MantleReach = 0.7f;
+	private const float MantleDuration = 0.35f;
+
+	private readonly FootstepController _footstepLogic = new();
+	private static readonly StringName _defaultMaterial = "default";
+
+	private readonly GrenadeController _grenade = new();
+	private static readonly float[] _mantleForwardOffsets = { 0.08f, 0.18f, 0.35f };
+
+	private bool _wasOnFloor;
+	private Vector3 _mantleStart;
+	private Vector3 _mantleTarget;
+	private float _mantleTimer;
+	private ulong _lastStepupBlockedLogMs;
+	private ulong _lastStepupSuccessLogMs;
+	private Vector3 _stepupLastBlockedPos = new(float.MinValue, 0, 0);
+	private uint _stepupLastBlockedTick;
+	private const uint StepupBlockedCooldownTicks = 8;
+
+	private double _reconcileWindowStartSec;
+
+	private float _serverSmoothedBodyYaw;
+	private bool _serverBodyYawInitialized;
+	private const float ServerBodyYawMaxTwistRad = 1.5708f;
+	private const float ServerBodyYawRateMoving = 12f;
+	private const float ServerBodyYawRateStanding = 6f;
+
+	private static readonly StringName _pTpsAimAdd = "parameters/AimAdd/add_amount";
+
+	protected float _fixedDt;
+	protected CapsuleShape3D _capsule;
+	protected Vector3 _headBasePos;
+
+	protected HitboxRig _hitboxRig;
+	protected virtual bool NeedsHitboxRig => true;
+	protected int _activeSlot;
+
+	protected Vector3 _pendingThrowOrigin;
+	protected Vector3 _pendingThrowVel;
+	protected bool _pendingThrowValid;
+
+	protected float _preMoveVelocityY;
+	protected Vector3 _prevPhysicsPos;
+	protected Vector3 _currentPhysicsPos;
+	protected bool _isMantling;
+	protected uint _mantleReconcileBlockUntilTick;
+	protected MovementInput _lastMovementInput;
+
+	protected Vector3 _correctionPending;
+	protected Vector3 _visualErrorOffset;
+	protected float _activeBleedRate = 6.5f;
+
+	protected ulong _tickStartUsec;
+	protected ulong _lastFirePressUsec;
+
+	protected readonly System.Collections.Generic.List<BufferedSubtickEvent> _subtickBuffer = new(Packets.MaxSubtickEventsWire);
+	protected InputBits _liveBits;
+	protected InputBits _intervalStartBits;
+	protected float _intervalStartViewYaw;
+	protected float _intervalStartViewPitch;
+	protected ulong _prevTickStartUsec;
+
+	protected PhysicsRayQueryParameters3D _rayQuery;
+	protected readonly PhysicsRayQueryResult3D _rayResult = new();
+	protected Godot.Collections.Array<Rid> _selfExclude;
+	protected bool _waitingForFadeOut;
+	protected int _ticksSinceSpawn;
+	protected const int SpawnSettleTicks = 30;
+
+	protected bool _isReplaying;
+
+	protected int _reconcileCountWindow;
 	public PlayerAudio Audio { get; private set; }
 
 	public const int TickRate = 128;
-	protected float _fixedDt;
 	public uint CurrentTick { get; protected set; }
 
 	[Export(PropertyHint.Range, "0.5,2.5,0.05")]
@@ -32,21 +130,11 @@ public partial class NetworkPlayer : CharacterBody3D
 
 	[Export]
 	public CollisionShape3D BodyCollision;
-	protected CapsuleShape3D _capsule;
-	protected Vector3 _headBasePos;
-
 	public byte NetId;
 
 	[Export]
 	public Skeleton3D TpsSkeleton;
 
-	protected HitboxRig _hitboxRig;
-	/// <summary>Hitbox rig accessor (NetServer debug broadcasts need positions).</summary>
-	public HitboxRig GetHitboxRig() => _hitboxRig;
-
-	/// <summary>Whether this driver builds a hitbox rig. ServerPlayer needs it for hit-reg, the puppet for
-	/// the debug overlay + casing self-exclude; LocalPlayer overrides to false.</summary>
-	protected virtual bool NeedsHitboxRig => true;
 	/// <summary>Bone-pose history for lag-comp. ServerAgent only.</summary>
 	public BonePoseRewindBuffer BoneHistory;
 
@@ -79,10 +167,6 @@ public partial class NetworkPlayer : CharacterBody3D
 			}
 		}
 	}
-	private bool _isFrozen;
-	private uint _savedCollisionLayer;
-	private uint _savedCollisionMask;
-
 	/// <summary>Death: no movement, collision, or shooting. Set by NetServer on HP=0, cleared on respawn.
 	/// Same collision-zero logic as IsFrozen.</summary>
 	public bool IsDead
@@ -112,16 +196,8 @@ public partial class NetworkPlayer : CharacterBody3D
 			}
 		}
 	}
-	private bool _isDead;
-	private uint _savedCollisionLayerDead;
-	private uint _savedCollisionMaskDead;
-
 	/// <summary>Tick of the last consumed input. Sent back as ackedTick for reconciliation.</summary>
 	public uint LastAppliedInputTick;
-
-	/// <summary>Unique capsule resource per instance so crouch resize doesn't shrink every player.</summary>
-	protected void SetupCapsule() =>
-		_capsule = CharacterSetup.SetupCapsule(this, BodyCollision, StandHeight, CapsuleRadius, FloorMaxAngleDeg, FloorSnapDist);
 
 	[ExportGroup("Firing")]
 	[Export]
@@ -133,11 +209,6 @@ public partial class NetworkPlayer : CharacterBody3D
 	public float HitscanRange = 200f;
 	[Export]
 	public uint HitscanMask = 1;
-
-	private const float MantleMinHeight = 1.0f;
-	private const float MantleMaxHeight = 1.75f;
-	private const float MantleReach = 0.7f;
-	private const float MantleDuration = 0.35f;
 
 	/// <summary>True when this instance is a puppet visual. Set by the PuppetPlayer wrapper before AddChild
 	/// (mutable because the wrapper owns the flag).</summary>
@@ -156,23 +227,9 @@ public partial class NetworkPlayer : CharacterBody3D
 	/// follows the look direction; the body catches up past 90° delta.</summary>
 	public float PuppetSpineTwist;
 
-	private readonly FootstepController _footstepLogic = new();
-	/// <summary>Cached fallback footstep material; avoids a fresh StringName per untagged step.</summary>
-	private static readonly StringName _defaultMaterial = "default";
-
-	private readonly GrenadeController _grenade = new();
-	protected int _activeSlot;
-
-	/// <summary>Mantle down-raycast forward offsets, pre-allocated to avoid per-tick allocations.</summary>
-	private static readonly float[] _mantleForwardOffsets = { 0.08f, 0.18f, 0.35f };
-
 	/// <summary>TpsAimModifier under the skeleton; drives spine twist/pitch for the TPS aim pose (server +
 	/// remote). Auto-created in _Ready when absent.</summary>
 	public TpsAimModifier AimModifier { get; private set; }
-
-	protected Vector3 _pendingThrowOrigin;
-	protected Vector3 _pendingThrowVel;
-	protected bool _pendingThrowValid;
 
 	/// <summary>Netcode reads the footstep phase for the snapshot.</summary>
 	public FootstepController FootstepLogic => _footstepLogic;
@@ -183,70 +240,12 @@ public partial class NetworkPlayer : CharacterBody3D
 	/// <summary>Grenade charge 0..1 while throw is held, for the HUD.</summary>
 	public float GrenadeCharge => _grenade.Charge;
 
-	private bool _wasOnFloor;
-	protected float _preMoveVelocityY;
-	protected Vector3 _prevPhysicsPos;
-	protected Vector3 _currentPhysicsPos;
-	protected bool _isMantling;
-	private Vector3 _mantleStart;
-	private Vector3 _mantleTarget;
-	private float _mantleTimer;
-	/// <summary>Reconciliation is blocked until this tick (mantle + grace window). Mantle state isn't
-	/// checkpointed, so a replay during/after a mantle would snap the player back from stale snapshots.</summary>
-	protected uint _mantleReconcileBlockUntilTick;
-	protected MovementInput _lastMovementInput;
-
-	/// <summary>Hook after the deterministic step. LocalPlayer pushes prediction + acks its own tick;
-	/// ServerPlayer acks the consumed net-input tick. Base/puppet: no-op (puppets don't tick).</summary>
-	protected virtual void OnTickApplied() { }
 	/// <summary>Prediction buffer for reconciliation. Filled only for IsLocalPlayer.</summary>
 	public readonly PredictionBuffer Prediction = new();
-	/// <summary>Small drift detected by ApplyServerCorrection is faded out through this offset, not snapped.</summary>
-	protected Vector3 _correctionPending;
-	/// <summary>Visual error after a replay (old visible minus new replay position). _Process adds this to
-	/// GlobalPosition and fades it per tick to avoid a visible snap.</summary>
-	protected Vector3 _visualErrorOffset;
-	/// <summary>Bleed-out rate (1/sec) for _visualErrorOffset. Set by ApplyServerCorrection from drift
-	/// magnitude; reset in ResetInterpToCurrentPos.</summary>
-	protected float _activeBleedRate = 6.5f;
+	/// <summary>Authority position for snapshots/reconciliation — real physics state, never the lerped
+	/// _Process value (which drifts during the inter-tick window).</summary>
+	public Vector3 AuthorityPosition { get => _currentPhysicsPos; set { } }
 
-	/// <summary>Wallclock at the start of the current FixedTick. Subtick-fire subtracts this from the
-	/// fire-press wallclock to get a fractional in-tick position.</summary>
-	protected ulong _tickStartUsec;
-	/// <summary>Wallclock of the most recent fire-press edge (LocalPlayer's _Input, sub-tick precision),
-	/// read by SendNetInput to compute FireSubTick. 0 on server agents and puppets.</summary>
-	protected ulong _lastFirePressUsec;
-
-	protected readonly System.Collections.Generic.List<BufferedSubtickEvent> _subtickBuffer = new(Packets.MaxSubtickEventsWire);
-	/// <summary>Held-input bitmask, updated live per input event. End-of-tick value seeds MovementInput's
-	/// legacy held flags and the next tick's _intervalStartBits.</summary>
-	protected InputBits _liveBits;
-	/// <summary>Held-input bitmask at the start of the collection interval (previous tick's _liveBits).
-	/// Used as MovementInput.InitialBits.</summary>
-	protected InputBits _intervalStartBits;
-	protected float _intervalStartViewYaw;
-	protected float _intervalStartViewPitch;
-	/// <summary>Wallclock at the start of the previous tick — lower bound of the interval whose events flush
-	/// into this tick's MovementInput. Set in _PhysicsProcess just before _tickStartUsec is updated.</summary>
-	protected ulong _prevTickStartUsec;
-
-	protected PhysicsRayQueryParameters3D _rayQuery;
-	protected readonly PhysicsRayQueryResult3D _rayResult = new();
-	protected Godot.Collections.Array<Rid> _selfExclude;
-	/// <summary>Rate-limit (msec) for the stepup-blocked log (max once/sec).</summary>
-	private ulong _lastStepupBlockedLogMs;
-	/// <summary>Rate-limit (msec) for the stepup-success log (throttled for GC).</summary>
-	private ulong _lastStepupSuccessLogMs;
-	/// <summary>True for LocalPlayer from _Ready until the fade-out triggers once FootstepAudio preloads.</summary>
-	protected bool _waitingForFadeOut;
-	/// <summary>Position of the last blocked TryStepUp. Cooldown gate: skip the full TestMove sequence until
-	/// the player moves &gt;10cm — 3×TestMove + 1×IntersectRay per tick dominated load walking into a wall.</summary>
-	private Vector3 _stepupLastBlockedPos = new(float.MinValue, 0, 0);
-	private uint _stepupLastBlockedTick;
-	private const uint StepupBlockedCooldownTicks = 8;
-
-	/// <summary>Sets up physics tuning, audio banks, hitbox rig, and TPS aim. Server agents skip the
-	/// visual-only setup.</summary>
 	private void SetupSim()
 	{
 		Engine.PhysicsTicksPerSecond = TickRate;
@@ -329,16 +328,6 @@ public partial class NetworkPlayer : CharacterBody3D
 		OnSimReady();
 	}
 
-	/// <summary>Per-mode tail of SetupSim: collision layer + mode-specific spawn finalization. Base/puppet =
-	/// client layer; ServerPlayer and LocalPlayer override.</summary>
-	protected virtual void OnSimReady()
-	{
-		CollisionLayer = 1u << 1;
-		CollisionMask = 1u | (1u << 1);
-	}
-
-	/// <summary>Fires + aborts every AnimationNodeOneShot (found via "/request" property names) at spawn, so
-	/// Godot lazy-loads the animations here instead of spiking on the first gameplay event.</summary>
 	private void PreWarmAnimationOneShots(AnimationTree tree)
 	{
 		if (tree == null) return;
@@ -359,83 +348,6 @@ public partial class NetworkPlayer : CharacterBody3D
 			Dbg.Print($"[prewarm] pre-fired {count} one-shot(s) on '{tree.Name}' ({(IsPuppet ? "puppet" : IsServerAgent ? "server-agent" : "local")})");
 	}
 
-
-	/// <summary>Server-only: frees TPS meshes and hides the visual root (hitbox-posing bones remain).
-	/// ServerPlayer overrides; base no-op.</summary>
-	protected virtual void DisableExpensiveSubtreeProcessing() { }
-
-	/// <summary>Local-only: plays silent footstep/jump/land samples off-screen at spawn to lazy-load the
-	/// banks. LocalPlayer overrides; base no-op.</summary>
-	protected virtual void WarmUpAudio() { }
-
-	/// <summary>Authority position for snapshots/reconciliation — real physics state, never the lerped
-	/// _Process value (which drifts during the inter-tick window).</summary>
-	public Vector3 AuthorityPosition { get => _currentPhysicsPos; set { } }
-
-	/// <summary>Ticks since spawn/respawn. Reconciliation is skipped inside the settle window (30 ticks).</summary>
-	protected int _ticksSinceSpawn;
-	protected const int SpawnSettleTicks = 30;
-
-	/// <summary>True while a reconciliation is replaying the last ticks. Side effects (audio, tracers,
-	/// decals, net-input send) are skipped — they already ran during the original tick.</summary>
-	protected bool _isReplaying;
-
-	/// <summary>Called by NetServer once per tick (after BoneAttachment3D updates) — snapshots all hitbox
-	/// GlobalTransforms into the ring buffer. Server agent only.</summary>
-	public void PushBoneHistory(uint tick)
-	{
-		if (BoneHistory == null || _hitboxRig == null) return;
-		BoneHistory.Push(tick, _hitboxRig.CollisionShapes);
-	}
-
-	/// <summary>Resets render-interp after a teleport so the first frame doesn't lerp from the old position,
-	/// and clears any in-flight visual reconciliation offset.</summary>
-	public void ResetInterpToCurrentPos()
-	{
-		_prevPhysicsPos = GlobalPosition;
-		_currentPhysicsPos = GlobalPosition;
-		_ticksSinceSpawn = 0;
-		Prediction.Clear();
-		_visualErrorOffset = Vector3.Zero;
-		_activeBleedRate = Mathf.Max(0.01f, ConVars.Cl.ReconBleedNormal);
-		_lastFirePressUsec = 0;
-	}
-
-	/// <summary>Per-physics-tick driver. Skips puppets (externally positioned) and frozen agents; runs
-	/// FixedTick for LocalPlayer and ServerAgent and triggers visual updates on non-server instances.</summary>
-	public override void _PhysicsProcess(double delta)
-	{
-		if (IsPuppet) return;
-		if (IsFrozen) return;
-		if (!IsLocalPlayer && !IsServerAgent) return;
-		using var _prof = IsServerAgent ? MiniProfiler.SampleServer("NetworkPlayer._PhysicsProcess") : MiniProfiler.SampleClient("NetworkPlayer._PhysicsProcess (Local)");
-
-		_prevTickStartUsec = _tickStartUsec;
-		_tickStartUsec = Time.GetTicksUsec();
-
-		if (IsLocalPlayer)
-		{
-			double nowSec = Time.GetTicksMsec() / 1000.0;
-			if (nowSec - _reconcileWindowStartSec >= 1.0)
-			{
-				NetStats.ReconcilesPerSec = _reconcileCountWindow;
-				_reconcileCountWindow = 0;
-				_reconcileWindowStartSec = nowSec;
-			}
-		}
-
-		GlobalPosition = _currentPhysicsPos;
-		_prevPhysicsPos = _currentPhysicsPos;
-
-		FixedTick(_fixedDt);
-
-		_currentPhysicsPos = GlobalPosition;
-
-		using (MiniProfiler.SampleClient("NetworkPlayer.UpdateTpsBodyAim")) UpdateTpsBodyAim();
-	}
-
-	/// <summary>Server-replayable tick step, dt = 1/TickRate. Only code that must also run on the server
-	/// belongs here (movement, fire, stamina).</summary>
 	private void FixedTick(float dt)
 	{
 		CurrentTick++;
@@ -507,14 +419,6 @@ public partial class NetworkPlayer : CharacterBody3D
 		}
 	}
 
-	/// <summary>Per-second reconcile-rate window feeding NetStats.ReconcilesPerSec. Bumped by
-	/// LocalPlayer.ApplyServerCorrection; the window is rolled in the shared stats pass.</summary>
-	protected int _reconcileCountWindow;
-	private double _reconcileWindowStartSec;
-
-
-	/// <summary>Steps the footstep cadence and emits a step event per step. Cadence is
-	/// deterministic/replayable; material probing and audio are client-side side effects.</summary>
 	private void HandleFootsteps()
 	{
 		using (MiniProfiler.SampleClient("NetworkPlayer.HandleFootsteps.Cadence"))
@@ -542,11 +446,248 @@ public partial class NetworkPlayer : CharacterBody3D
 		OnFootstepEvent(ground, material);
 	}
 
-	/// <summary>Per-tick weapon audio (shoot/dry-fire/reload). Cosmetic, Local-only. LocalPlayer overrides;
-	/// base no-op.</summary>
+	private void HandleHitscan()
+	{
+		if (_isReplaying) return;
+		ResolveShot(GetWorld3D().DirectSpaceState);
+	}
+
+	private FireInput BuildFireInput(float dt)
+	{
+		bool weaponSlot = _activeSlot == 0;
+		WeaponButtons btn = SampleWeaponButtons();
+		bool firePressed = weaponSlot && btn.Fire;
+		bool reloadPressed = weaponSlot && btn.Reload;
+		bool inspectPressed = weaponSlot && btn.Inspect;
+		bool adsHeld = weaponSlot && btn.Ads;
+
+		WeaponStats weapon = ConVars.Weapons.AR15;
+
+		Vector3 shootOrigin = HeadPitch != null ? HeadPitch.GlobalPosition : GlobalPosition;
+
+		uint fireTick = (IsServerAgent && NetInputSource.HasValue) ? NetInputSource.Value.TickIndex : CurrentTick;
+
+		float fireYaw = Movement.SubtickFireViewValid ? Movement.SubtickFireViewYaw : Rotation.Y;
+		float firePitch = Movement.SubtickFireViewValid
+			? Movement.SubtickFireViewPitch
+			: (HeadPitch != null ? HeadPitch.Rotation.X : 0f);
+
+		return new FireInput
+		{
+			TickIndex = fireTick,
+			FirePressed = firePressed,
+			ReloadPressed = reloadPressed,
+			InspectPressed = inspectPressed,
+			AdsHeld = adsHeld,
+			CanFire = CanFire && weapon != null,
+			Weapon = weapon,
+			Speed = Movement.HorizontalSpeed,
+			ShooterPosition = shootOrigin,
+			ViewYaw = fireYaw,
+			ViewPitch = firePitch,
+			Dt = dt,
+		};
+	}
+
+	private void HandleGrenades(float dt)
+	{
+		ResolveActiveSlot();
+		bool grenadeSlot = _activeSlot == 1;
+		bool firePressed = SampleWeaponButtons().Fire;
+		_grenade.Step(new GrenadeInput
+		{
+			SlotActive = grenadeSlot,
+			ThrowHeld = grenadeSlot && firePressed,
+			Dt = dt,
+		});
+
+		if (_grenade.DidThrowThisFrame)
+		{
+			ThrowGrenade();
+		}
+		else
+		{
+			_pendingThrowValid = grenadeSlot
+				&& ComputeThrow(_grenade.Charge, out _pendingThrowOrigin, out _pendingThrowVel);
+		}
+	}
+
+	private void ThrowGrenade()
+	{
+		if (!_pendingThrowValid) return;
+		var (projectileId, ownerNetId) = RegisterGrenadeThrow(_pendingThrowOrigin, _pendingThrowVel);
+		SmokeGrenade.Spawn(GetParent(), _pendingThrowOrigin, _pendingThrowVel, GetRid(),
+			ownerNetId: ownerNetId, projectileId: projectileId, isPuppet: false);
+		Dbg.Print($"[grenade] thrown tick={CurrentTick} vel={_pendingThrowVel:F1} pid={projectileId}");
+	}
+
+	private bool ComputeThrow(float charge, out Vector3 origin, out Vector3 vel)
+	{
+		origin = vel = Vector3.Zero;
+		if (HeadPitch == null) return false;
+		Vector3 fwd = -HeadPitch.GlobalTransform.Basis.Z;
+		Vector3 dir = (fwd + Vector3.Up * ConVars.Sv.GrenadeThrowUpBias).Normalized();
+		float speed = Mathf.Lerp(ConVars.Sv.GrenadeMinThrowSpeed, ConVars.Sv.GrenadeMaxThrowSpeed, charge);
+		Vector3 inherit = new Vector3(Velocity.X, 0f, Velocity.Z) * ConVars.Sv.GrenadeInheritVelocity;
+		vel = dir * speed + inherit;
+		origin = HeadPitch.GlobalPosition + fwd * 0.4f;
+		return true;
+	}
+
+	private void SetupHeadPitch()
+	{
+		if (HeadPitch != null)
+		{
+			HeadPitch.Position = new Vector3(HeadPitch.Position.X, StandEyeHeight, HeadPitch.Position.Z);
+			_headBasePos = HeadPitch.Position;
+			Dbg.Print($"[character] Eye height set to {StandEyeHeight:0.00}m");
+		}
+		else GD.PushWarning("[character] HeadPitch reference missing — camera will not drop on crouch");
+	}
+
+	private void TryMantle()
+	{
+		if (_isMantling) return;
+		if (!Movement.IsAirborne) return;
+		if (Velocity.Y < -0.5f) return;
+		if (Movement.LastWishDir.LengthSquared() < 0.01f) return;
+		if (!_lastMovementInput.CrouchHeld) return;
+
+		Vector3 forward = -Transform.Basis.Z;
+
+		Vector3 chest = GlobalPosition + new Vector3(0f, StandHeight * 0.5f, 0f);
+		var space = GetWorld3D().DirectSpaceState;
+
+		_rayQuery.CollisionMask = 1u;
+		_rayQuery.From = chest;
+		_rayQuery.To = chest + forward * MantleReach;
+		if (!space.IntersectRayInto(_rayQuery, _rayResult)) return;
+
+		Vector3 fwdNormal = _rayResult.GetNormal();
+		if (Mathf.Abs(fwdNormal.Y) > 0.4f) return;
+		Vector3 fwdHit = _rayResult.GetPosition();
+
+		Vector3 topPos = default;
+		float heightDiff = 0f;
+		bool foundTop = false;
+		float lastRejectedDiff = float.NaN;
+		foreach (float fwdOff in _mantleForwardOffsets)
+		{
+			Vector3 above = fwdHit + forward * fwdOff + new Vector3(0f, MantleMaxHeight, 0f);
+			_rayQuery.From = above;
+			_rayQuery.To = above + new Vector3(0f, -MantleMaxHeight * 1.5f, 0f);
+			if (!space.IntersectRayInto(_rayQuery, _rayResult)) continue;
+			if (_rayResult.GetNormal().Y < 0.7f) continue;
+			Vector3 p = _rayResult.GetPosition();
+			float hd = p.Y - GlobalPosition.Y;
+			if (hd < MantleMinHeight || hd > MantleMaxHeight)
+			{
+				lastRejectedDiff = hd;
+				continue;
+			}
+			if (!foundTop || hd < heightDiff)
+			{
+				topPos = p; heightDiff = hd;
+				foundTop = true;
+			}
+		}
+		if (!foundTop)
+		{
+			if (Dbg.Enabled && !float.IsNaN(lastRejectedDiff))
+			{
+				string reason = lastRejectedDiff < MantleMinHeight
+					? $"below mantle-min ({MantleMinHeight:F2}m) → crouch-jump physics suffices"
+					: $"above mantle-max ({MantleMaxHeight:F2}m) → obstacle too tall to climb";
+				Dbg.Print($"[mantle] REJECTED heightDiff={lastRejectedDiff:F2}m → {reason} | playerY={GlobalPosition.Y:F2}");
+			}
+			return;
+		}
+
+		Transform3D testTrans = new(GlobalTransform.Basis, topPos + new Vector3(0f, 0.05f, 0f));
+		if (TestMove(testTrans, new Vector3(0f, StandHeight, 0f)))
+		{
+			Dbg.Print($"[mantle] REJECTED capsule blocked at top | heightDiff={heightDiff:F2}m topY={topPos.Y:F2}");
+			return;
+		}
+
+		Vector3 landingPos = topPos;
+		Vector3 inwardProbe = topPos + forward * (CapsuleRadius * 0.5f) + new Vector3(0f, 0.3f, 0f);
+		_rayQuery.From = inwardProbe;
+		_rayQuery.To = inwardProbe + new Vector3(0f, -0.6f, 0f);
+		if (space.IntersectRayInto(_rayQuery, _rayResult)
+			&& _rayResult.GetNormal().Y >= 0.7f
+			&& Mathf.Abs(_rayResult.GetPosition().Y - topPos.Y) < 0.15f)
+		{
+			landingPos = _rayResult.GetPosition();
+		}
+
+		Dbg.Print($"[mantle] FIRED (climb) heightDiff={heightDiff:F2}m | topY={topPos.Y:F2} playerY={GlobalPosition.Y:F2} → target=({landingPos.X:F2},{landingPos.Y:F2},{landingPos.Z:F2})");
+
+		_isMantling = true;
+		_mantleStart = GlobalPosition;
+		_mantleTarget = landingPos + new Vector3(0f, 0.05f, 0f);
+		_mantleTimer = MantleDuration;
+		Velocity = Vector3.Zero;
+		_mantleReconcileBlockUntilTick = CurrentTick + (uint)Mathf.CeilToInt(MantleDuration * TickRate) + 30;
+	}
+
+	private void StepMantle(float dt)
+	{
+		_mantleTimer -= dt;
+		if (_mantleTimer <= 0f)
+		{
+			GlobalPosition = _mantleTarget;
+			Velocity = Vector3.Zero;
+			_isMantling = false;
+			if (IsLocalPlayer) Prediction.Clear();
+			return;
+		}
+		float progress = 1f - (_mantleTimer / MantleDuration);
+		float eased = progress * progress * (3f - 2f * progress);
+		GlobalPosition = _mantleStart.Lerp(_mantleTarget, eased);
+		Velocity = Vector3.Zero;
+	}
+
+	private void HandleLandingDetection()
+	{
+		bool onFloorNow = IsOnFloor();
+		if (onFloorNow && !_wasOnFloor)
+		{
+			if (!_isReplaying)
+				OnLandEvent(Mathf.Max(0f, -_preMoveVelocityY));
+		}
+		else if (!onFloorNow && _wasOnFloor)
+		{
+			Dbg.Print($"[floor] left — airborne | vY={Velocity.Y:F1}");
+		}
+		_wasOnFloor = onFloorNow;
+	}
+
+	private void HandleJumpAnimation()
+	{
+		if (Movement.DidJumpThisFrame && !_isReplaying)
+			OnJumpEvent();
+		if (Movement.DidWallJumpThisFrame && Dbg.Enabled)
+			Dbg.Print($"[walljump] vY={Velocity.Y:F2} | horizSpeed={Movement.HorizontalSpeed:F1}");
+	}
+
+	protected void SetupCapsule() =>
+		_capsule = CharacterSetup.SetupCapsule(this, BodyCollision, StandHeight, CapsuleRadius, FloorMaxAngleDeg, FloorSnapDist);
+
+	protected virtual void OnTickApplied() { }
+
+	protected virtual void OnSimReady()
+	{
+		CollisionLayer = 1u << 1;
+		CollisionMask = 1u | (1u << 1);
+	}
+
+	protected virtual void DisableExpensiveSubtreeProcessing() { }
+
+	protected virtual void WarmUpAudio() { }
+
 	protected virtual void HandleWeaponAudio() { }
 
-	/// <summary>Down-raycast under the feet with the same material detection as the hitscan.</summary>
 	protected HitInfo CastGround()
 	{
 		var space = GetWorld3D().DirectSpaceState;
@@ -554,20 +695,9 @@ public partial class NetworkPlayer : CharacterBody3D
 		return Hitscan.CastMulti(space, from, Vector3.Down, 1.0f, _selfExclude, mask: 1u);
 	}
 
-	/// <summary>True when the ground collider is in the "tunnel" group; swaps to tunnel reverb.</summary>
 	protected static bool IsTunnelGround(HitInfo ground)
 		=> ground.Hit && ground.Collider != null && ground.Collider.IsInGroup("tunnel");
 
-	/// <summary>Hitscan after DoFire, using Movement.LastShotOrigin/Direction. On server authority also does
-	/// lag-compensated damage and broadcasts ShotFired.</summary>
-	private void HandleHitscan()
-	{
-		if (_isReplaying) return;
-		ResolveShot(GetWorld3D().DirectSpaceState);
-	}
-
-	/// <summary>Per-shot resolution. Base = the local client's cosmetic pass (decal, smoke, tracer).
-	/// ServerPlayer overrides with the authoritative lag-comp cast + broadcast.</summary>
 	protected virtual void ResolveShot(PhysicsDirectSpaceState3D space)
 	{
 		HitInfo hit;
@@ -614,168 +744,12 @@ public partial class NetworkPlayer : CharacterBody3D
 		}
 	}
 
-	/// <summary>Samples this tick's weapon buttons from the input source. Base = neutral (puppets don't
-	/// tick); LocalPlayer reads Godot input, ServerPlayer the packet.</summary>
 	protected virtual WeaponButtons SampleWeaponButtons() => default;
 
-	/// <summary>Resolves _activeSlot from the input source (LocalPlayer: slot-key edges; ServerPlayer: the
-	/// packet's SlotIsGrenade bit). Base no-op (puppets / server-no-packet).</summary>
 	protected virtual void ResolveActiveSlot() { }
 
-	/// <summary>Builds the fire input, gating weapon actions when the grenade slot is active. ServerAgent
-	/// pulls triggers from NetInputSource (no Godot input on the headless server); LocalPlayer reads live input.</summary>
-	private FireInput BuildFireInput(float dt)
-	{
-		bool weaponSlot = _activeSlot == 0;
-		WeaponButtons btn = SampleWeaponButtons();
-		bool firePressed = weaponSlot && btn.Fire;
-		bool reloadPressed = weaponSlot && btn.Reload;
-		bool inspectPressed = weaponSlot && btn.Inspect;
-		bool adsHeld = weaponSlot && btn.Ads;
-
-		WeaponStats weapon = ConVars.Weapons.AR15;
-
-		Vector3 shootOrigin = HeadPitch != null ? HeadPitch.GlobalPosition : GlobalPosition;
-
-		uint fireTick = (IsServerAgent && NetInputSource.HasValue) ? NetInputSource.Value.TickIndex : CurrentTick;
-
-		float fireYaw = Movement.SubtickFireViewValid ? Movement.SubtickFireViewYaw : Rotation.Y;
-		float firePitch = Movement.SubtickFireViewValid
-			? Movement.SubtickFireViewPitch
-			: (HeadPitch != null ? HeadPitch.Rotation.X : 0f);
-
-		return new FireInput
-		{
-			TickIndex = fireTick,
-			FirePressed = firePressed,
-			ReloadPressed = reloadPressed,
-			InspectPressed = inspectPressed,
-			AdsHeld = adsHeld,
-			CanFire = CanFire && weapon != null,
-			Weapon = weapon,
-			Speed = Movement.HorizontalSpeed,
-			ShooterPosition = shootOrigin,
-			ViewYaw = fireYaw,
-			ViewPitch = firePitch,
-			Dt = dt,
-		};
-	}
-
-	/// <summary>Handles slot switching (weapon vs grenade) and steps the grenade charge; throws on
-	/// fire-release in the grenade slot. Deterministic/replayable; ServerAgent pulls the slot from the packet.</summary>
-	private void HandleGrenades(float dt)
-	{
-		ResolveActiveSlot();
-		bool grenadeSlot = _activeSlot == 1;
-		bool firePressed = SampleWeaponButtons().Fire;
-		_grenade.Step(new GrenadeInput
-		{
-			SlotActive = grenadeSlot,
-			ThrowHeld = grenadeSlot && firePressed,
-			Dt = dt,
-		});
-
-		if (_grenade.DidThrowThisFrame)
-		{
-			ThrowGrenade();
-		}
-		else
-		{
-			_pendingThrowValid = grenadeSlot
-				&& ComputeThrow(_grenade.Charge, out _pendingThrowOrigin, out _pendingThrowVel);
-		}
-	}
-
-	/// <summary>Spawns a SmokeGrenade in front of the camera; throw speed lerps with held charge.</summary>
-	private void ThrowGrenade()
-	{
-		if (!_pendingThrowValid) return;
-		var (projectileId, ownerNetId) = RegisterGrenadeThrow(_pendingThrowOrigin, _pendingThrowVel);
-		SmokeGrenade.Spawn(GetParent(), _pendingThrowOrigin, _pendingThrowVel, GetRid(),
-			ownerNetId: ownerNetId, projectileId: projectileId, isPuppet: false);
-		Dbg.Print($"[grenade] thrown tick={CurrentTick} vel={_pendingThrowVel:F1} pid={projectileId}");
-	}
-
-	/// <summary>Registers a thrown grenade with the netcode and returns its (projectileId, owner) for the
-	/// spawn. LocalPlayer allocates a predicted id and sends it to the server; base = (0,0).</summary>
 	protected virtual (uint projectileId, byte ownerNetId) RegisterGrenadeThrow(Vector3 origin, Vector3 vel) => (0u, 0);
 
-	/// <summary>Throw origin and velocity for a given charge. Shared by ThrowGrenade and the aim guide so the
-	/// preview matches the actual flight path.</summary>
-	private bool ComputeThrow(float charge, out Vector3 origin, out Vector3 vel)
-	{
-		origin = vel = Vector3.Zero;
-		if (HeadPitch == null) return false;
-		Vector3 fwd = -HeadPitch.GlobalTransform.Basis.Z;
-		Vector3 dir = (fwd + Vector3.Up * ConVars.Sv.GrenadeThrowUpBias).Normalized();
-		float speed = Mathf.Lerp(ConVars.Sv.GrenadeMinThrowSpeed, ConVars.Sv.GrenadeMaxThrowSpeed, charge);
-		Vector3 inherit = new Vector3(Velocity.X, 0f, Velocity.Z) * ConVars.Sv.GrenadeInheritVelocity;
-		vel = dir * speed + inherit;
-		origin = HeadPitch.GlobalPosition + fwd * 0.4f;
-		return true;
-	}
-
-	private float _serverSmoothedBodyYaw;
-	private bool _serverBodyYawInitialized;
-	private const float ServerBodyYawMaxTwistRad = 1.5708f;
-	private const float ServerBodyYawRateMoving = 12f;
-	private const float ServerBodyYawRateStanding = 6f;
-
-	/// <summary>Syncs spine twist/pitch onto AimModifier. The server-agent path mirrors the puppet's lagged
-	/// body-yaw smoothing and rotates the skeleton root so bone poses match the puppet — that's what makes
-	/// lag-comp correct, since BoneHistory then stores aim+twist-correct GlobalTransforms.</summary>
-	public void UpdateTpsBodyAim()
-	{
-		if (IsServerAgent && AimModifier != null && NetInputSource.HasValue)
-		{
-			float svViewYaw = NetInputSource.Value.ViewYaw;
-			if (!_serverBodyYawInitialized)
-			{
-				_serverSmoothedBodyYaw = svViewYaw;
-				_serverBodyYawInitialized = true;
-			}
-			Vector3 hVel = new Vector3(Velocity.X, 0f, Velocity.Z);
-			bool moving = hVel.LengthSquared() > 1.0f;
-			float rate = moving ? ServerBodyYawRateMoving : ServerBodyYawRateStanding;
-			float lerpT = Mathf.Min(1f, rate * _fixedDt);
-			_serverSmoothedBodyYaw = Mathf.LerpAngle(_serverSmoothedBodyYaw, svViewYaw, lerpT);
-			float postTwist = Mathf.Wrap(svViewYaw - _serverSmoothedBodyYaw, -Mathf.Pi, Mathf.Pi);
-			if (Mathf.Abs(postTwist) > ServerBodyYawMaxTwistRad)
-				_serverSmoothedBodyYaw = svViewYaw - Mathf.Sign(postTwist) * ServerBodyYawMaxTwistRad;
-			var rot = Rotation; rot.Y = _serverSmoothedBodyYaw; Rotation = rot;
-			AimModifier.SpineTwist = Mathf.Wrap(svViewYaw - _serverSmoothedBodyYaw, -Mathf.Pi, Mathf.Pi);
-			return;
-		}
-
-		if (ViewMode != ViewMode.Tps)
-		{
-			if (AimModifier != null) AimModifier.SpineTwist = 0f;
-			return;
-		}
-
-		float twist = IsPuppet ? PuppetSpineTwist : 0f;
-		if (AimModifier != null)
-			AimModifier.SpineTwist = twist;
-		if (TpsAnimTree != null)
-			TpsAnimTree.Set(_pTpsAimAdd, Movement?.AdsBlend ?? 0f);
-	}
-
-	private static readonly StringName _pTpsAimAdd = "parameters/AimAdd/add_amount";
-
-	/// <summary>Sets the head-pitch pivot to stand-eye height.</summary>
-	private void SetupHeadPitch()
-	{
-		if (HeadPitch != null)
-		{
-			HeadPitch.Position = new Vector3(HeadPitch.Position.X, StandEyeHeight, HeadPitch.Position.Z);
-			_headBasePos = HeadPitch.Position;
-			Dbg.Print($"[character] Eye height set to {StandEyeHeight:0.00}m");
-		}
-		else GD.PushWarning("[character] HeadPitch reference missing — camera will not drop on crouch");
-	}
-
-	/// <summary>Base = neutral idle input (ServerPlayer's fallback before the first packet). Overridden by
-	/// LocalPlayer (live input) and ServerPlayer (net packet).</summary>
 	protected virtual MovementInput BuildMovementInput(float dt) => new()
 	{
 		TickIndex = CurrentTick,
@@ -788,7 +762,6 @@ public partial class NetworkPlayer : CharacterBody3D
 		ViewPitch = HeadPitch != null ? HeadPitch.Rotation.X : 0f,
 	};
 
-	/// <summary>Resizes the capsule and lerps eye height between stand and crouch.</summary>
 	protected void ApplyCrouchHeight()
 	{
 		CharacterSetup.ApplyCrouchHeight(_capsule, BodyCollision, StandHeight, CrouchHeight, Movement.CrouchBlend);
@@ -800,9 +773,6 @@ public partial class NetworkPlayer : CharacterBody3D
 		}
 	}
 
-	/// <summary>Pre-MoveAndSlide step-up: tests for a small lip ahead and lifts the body by the actual step
-	/// height; MoveAndSlide + FloorSnap settle onto the new floor. Runs every tick (gating caused
-	/// stair-stutter at sprint speed). Skips when airborne.</summary>
 	protected void TryStepUp(float dt)
 	{
 		if (StepMaxHeight <= 0f || !IsOnFloor()) return;
@@ -902,152 +872,105 @@ public partial class NetworkPlayer : CharacterBody3D
 		}
 	}
 
-	/// <summary>Auto-mantle: airborne + forward wish + crouch held + an obstacle with a reachable flat top
-	/// ahead, lerps onto the top over MantleDuration. The crouch gate prevents mantles on run-jumps.</summary>
-	private void TryMantle()
-	{
-		if (_isMantling) return;
-		if (!Movement.IsAirborne) return;
-		if (Velocity.Y < -0.5f) return;
-		if (Movement.LastWishDir.LengthSquared() < 0.01f) return;
-		if (!_lastMovementInput.CrouchHeld) return;
-
-		Vector3 forward = -Transform.Basis.Z;
-
-		Vector3 chest = GlobalPosition + new Vector3(0f, StandHeight * 0.5f, 0f);
-		var space = GetWorld3D().DirectSpaceState;
-
-		_rayQuery.CollisionMask = 1u;
-		_rayQuery.From = chest;
-		_rayQuery.To = chest + forward * MantleReach;
-		if (!space.IntersectRayInto(_rayQuery, _rayResult)) return;
-
-		Vector3 fwdNormal = _rayResult.GetNormal();
-		if (Mathf.Abs(fwdNormal.Y) > 0.4f) return;
-		Vector3 fwdHit = _rayResult.GetPosition();
-
-		Vector3 topPos = default;
-		float heightDiff = 0f;
-		bool foundTop = false;
-		float lastRejectedDiff = float.NaN;
-		foreach (float fwdOff in _mantleForwardOffsets)
-		{
-			Vector3 above = fwdHit + forward * fwdOff + new Vector3(0f, MantleMaxHeight, 0f);
-			_rayQuery.From = above;
-			_rayQuery.To = above + new Vector3(0f, -MantleMaxHeight * 1.5f, 0f);
-			if (!space.IntersectRayInto(_rayQuery, _rayResult)) continue;
-			if (_rayResult.GetNormal().Y < 0.7f) continue;
-			Vector3 p = _rayResult.GetPosition();
-			float hd = p.Y - GlobalPosition.Y;
-			if (hd < MantleMinHeight || hd > MantleMaxHeight)
-			{
-				lastRejectedDiff = hd;
-				continue;
-			}
-			if (!foundTop || hd < heightDiff)
-			{
-				topPos = p; heightDiff = hd;
-				foundTop = true;
-			}
-		}
-		if (!foundTop)
-		{
-			if (Dbg.Enabled && !float.IsNaN(lastRejectedDiff))
-			{
-				string reason = lastRejectedDiff < MantleMinHeight
-					? $"below mantle-min ({MantleMinHeight:F2}m) → crouch-jump physics suffices"
-					: $"above mantle-max ({MantleMaxHeight:F2}m) → obstacle too tall to climb";
-				Dbg.Print($"[mantle] REJECTED heightDiff={lastRejectedDiff:F2}m → {reason} | playerY={GlobalPosition.Y:F2}");
-			}
-			return;
-		}
-
-		Transform3D testTrans = new(GlobalTransform.Basis, topPos + new Vector3(0f, 0.05f, 0f));
-		if (TestMove(testTrans, new Vector3(0f, StandHeight, 0f)))
-		{
-			Dbg.Print($"[mantle] REJECTED capsule blocked at top | heightDiff={heightDiff:F2}m topY={topPos.Y:F2}");
-			return;
-		}
-
-		Vector3 landingPos = topPos;
-		Vector3 inwardProbe = topPos + forward * (CapsuleRadius * 0.5f) + new Vector3(0f, 0.3f, 0f);
-		_rayQuery.From = inwardProbe;
-		_rayQuery.To = inwardProbe + new Vector3(0f, -0.6f, 0f);
-		if (space.IntersectRayInto(_rayQuery, _rayResult)
-			&& _rayResult.GetNormal().Y >= 0.7f
-			&& Mathf.Abs(_rayResult.GetPosition().Y - topPos.Y) < 0.15f)
-		{
-			landingPos = _rayResult.GetPosition();
-		}
-
-		Dbg.Print($"[mantle] FIRED (climb) heightDiff={heightDiff:F2}m | topY={topPos.Y:F2} playerY={GlobalPosition.Y:F2} → target=({landingPos.X:F2},{landingPos.Y:F2},{landingPos.Z:F2})");
-
-		_isMantling = true;
-		_mantleStart = GlobalPosition;
-		_mantleTarget = landingPos + new Vector3(0f, 0.05f, 0f);
-		_mantleTimer = MantleDuration;
-		Velocity = Vector3.Zero;
-		_mantleReconcileBlockUntilTick = CurrentTick + (uint)Mathf.CeilToInt(MantleDuration * TickRate) + 30;
-	}
-
-	/// <summary>Smoothstep lerp during an active mantle.</summary>
-	private void StepMantle(float dt)
-	{
-		_mantleTimer -= dt;
-		if (_mantleTimer <= 0f)
-		{
-			GlobalPosition = _mantleTarget;
-			Velocity = Vector3.Zero;
-			_isMantling = false;
-			if (IsLocalPlayer) Prediction.Clear();
-			return;
-		}
-		float progress = 1f - (_mantleTimer / MantleDuration);
-		float eased = progress * progress * (3f - 2f * progress);
-		GlobalPosition = _mantleStart.Lerp(_mantleTarget, eased);
-		Velocity = Vector3.Zero;
-	}
-
-	/// <summary>Detects floor touchdown/lift-off, triggers landing anim + audio, and broadcasts the land
-	/// event from server authority.</summary>
-	private void HandleLandingDetection()
-	{
-		bool onFloorNow = IsOnFloor();
-		if (onFloorNow && !_wasOnFloor)
-		{
-			if (!_isReplaying)
-				OnLandEvent(Mathf.Max(0f, -_preMoveVelocityY));
-		}
-		else if (!onFloorNow && _wasOnFloor)
-		{
-			Dbg.Print($"[floor] left — airborne | vY={Velocity.Y:F1}");
-		}
-		_wasOnFloor = onFloorNow;
-	}
-
-	/// <summary>Jump-edge anim trigger, audio, and server jump-event broadcast.</summary>
-	private void HandleJumpAnimation()
-	{
-		if (Movement.DidJumpThisFrame && !_isReplaying)
-			OnJumpEvent();
-		if (Movement.DidWallJumpThisFrame && Dbg.Enabled)
-			Dbg.Print($"[walljump] vY={Velocity.Y:F2} | horizSpeed={Movement.HorizontalSpeed:F1}");
-	}
-
-	/// <summary>Step-edge event. ServerPlayer broadcasts the step; LocalPlayer plays the audio. Base/puppet
-	/// no-op. Probed ground/material passed in.</summary>
 	protected virtual void OnFootstepEvent(HitInfo ground, StringName material) { }
 
-	/// <summary>Land-edge event. ServerPlayer broadcasts the impact; LocalPlayer plays the audio. Base/puppet
-	/// no-op. Replay-gated by the caller.</summary>
 	protected virtual void OnLandEvent(float impact) { }
 
-	/// <summary>Jump-edge event. ServerPlayer broadcasts the jump; LocalPlayer plays the audio. Base/puppet
-	/// no-op. Replay-gated by the caller.</summary>
 	protected virtual void OnJumpEvent() { }
 
-	/// <summary>Reload-start edge event. ServerPlayer broadcasts the mag-drop. Base/local/puppet no-op (local
-	/// drops its own mag via the FPS montage). Replay-gated by the caller.</summary>
 	protected virtual void OnDropMagEvent() { }
 
+	/// <summary>Hitbox rig accessor (NetServer debug broadcasts need positions).</summary>
+	/// <summary>The lag-compensation hitbox rig.</summary>
+	public HitboxRig GetHitboxRig() => _hitboxRig;
+
+	/// <summary>Called by NetServer once per tick (after BoneAttachment3D updates) — snapshots all hitbox
+	/// GlobalTransforms into the ring buffer. Server agent only.</summary>
+	/// <summary>Stores the current hitbox transforms for the tick, for lag-compensated hit checks.</summary>
+	public void PushBoneHistory(uint tick)
+	{
+		if (BoneHistory == null || _hitboxRig == null) return;
+		BoneHistory.Push(tick, _hitboxRig.CollisionShapes);
+	}
+
+	/// <summary>Resets render-interp and reconciliation after a teleport so the first frame doesn't lerp from the old position.</summary>
+	public void ResetInterpToCurrentPos()
+	{
+		_prevPhysicsPos = GlobalPosition;
+		_currentPhysicsPos = GlobalPosition;
+		_ticksSinceSpawn = 0;
+		Prediction.Clear();
+		_visualErrorOffset = Vector3.Zero;
+		_activeBleedRate = Mathf.Max(0.01f, ConVars.Cl.ReconBleedNormal);
+		_lastFirePressUsec = 0;
+	}
+
+	/// <summary>Per-physics-tick driver for the local player and server agent; skips puppets and frozen agents.</summary>
+	public override void _PhysicsProcess(double delta)
+	{
+		if (IsPuppet) return;
+		if (IsFrozen) return;
+		if (!IsLocalPlayer && !IsServerAgent) return;
+		using var _prof = IsServerAgent ? MiniProfiler.SampleServer("NetworkPlayer._PhysicsProcess") : MiniProfiler.SampleClient("NetworkPlayer._PhysicsProcess (Local)");
+
+		_prevTickStartUsec = _tickStartUsec;
+		_tickStartUsec = Time.GetTicksUsec();
+
+		if (IsLocalPlayer)
+		{
+			double nowSec = Time.GetTicksMsec() / 1000.0;
+			if (nowSec - _reconcileWindowStartSec >= 1.0)
+			{
+				NetStats.ReconcilesPerSec = _reconcileCountWindow;
+				_reconcileCountWindow = 0;
+				_reconcileWindowStartSec = nowSec;
+			}
+		}
+
+		GlobalPosition = _currentPhysicsPos;
+		_prevPhysicsPos = _currentPhysicsPos;
+
+		FixedTick(_fixedDt);
+
+		_currentPhysicsPos = GlobalPosition;
+
+		using (MiniProfiler.SampleClient("NetworkPlayer.UpdateTpsBodyAim")) UpdateTpsBodyAim();
+	}
+
+	/// <summary>Syncs spine twist/pitch onto AimModifier; the server-agent path mirrors the puppet's body-yaw so lag-comp poses match.</summary>
+	public void UpdateTpsBodyAim()
+	{
+		if (IsServerAgent && AimModifier != null && NetInputSource.HasValue)
+		{
+			float svViewYaw = NetInputSource.Value.ViewYaw;
+			if (!_serverBodyYawInitialized)
+			{
+				_serverSmoothedBodyYaw = svViewYaw;
+				_serverBodyYawInitialized = true;
+			}
+			Vector3 hVel = new Vector3(Velocity.X, 0f, Velocity.Z);
+			bool moving = hVel.LengthSquared() > 1.0f;
+			float rate = moving ? ServerBodyYawRateMoving : ServerBodyYawRateStanding;
+			float lerpT = Mathf.Min(1f, rate * _fixedDt);
+			_serverSmoothedBodyYaw = Mathf.LerpAngle(_serverSmoothedBodyYaw, svViewYaw, lerpT);
+			float postTwist = Mathf.Wrap(svViewYaw - _serverSmoothedBodyYaw, -Mathf.Pi, Mathf.Pi);
+			if (Mathf.Abs(postTwist) > ServerBodyYawMaxTwistRad)
+				_serverSmoothedBodyYaw = svViewYaw - Mathf.Sign(postTwist) * ServerBodyYawMaxTwistRad;
+			var rot = Rotation; rot.Y = _serverSmoothedBodyYaw; Rotation = rot;
+			AimModifier.SpineTwist = Mathf.Wrap(svViewYaw - _serverSmoothedBodyYaw, -Mathf.Pi, Mathf.Pi);
+			return;
+		}
+
+		if (ViewMode != ViewMode.Tps)
+		{
+			if (AimModifier != null) AimModifier.SpineTwist = 0f;
+			return;
+		}
+
+		float twist = IsPuppet ? PuppetSpineTwist : 0f;
+		if (AimModifier != null)
+			AimModifier.SpineTwist = twist;
+		if (TpsAnimTree != null)
+			TpsAnimTree.Set(_pTpsAimAdd, Movement?.AdsBlend ?? 0f);
+	}
 }

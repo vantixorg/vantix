@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 using LiteNetLib;
 using System.Collections.Generic;
@@ -205,7 +222,9 @@ public class NetClient
 
 		SubtickEventEncoded[] eventBuf = _eventPool[_eventPoolCursor];
 		_eventPoolCursor = (_eventPoolCursor + 1) % _eventPool.Length;
-		var encoded = Packets.EncodeInput(tickIndex, mi, firePressed, reloadPressed, inspectPressed, slotIsGrenade, fireSubTick, eventBuf);
+		float tickRate = (float)Engine.PhysicsTicksPerSecond;
+		byte interpDelayTicks = (byte)Mathf.Clamp(Mathf.RoundToInt(NetStats.InterpDelayMs / 1000f * tickRate), 0, 255);
+		var encoded = Packets.EncodeInput(tickIndex, mi, firePressed, reloadPressed, inspectPressed, slotIsGrenade, fireSubTick, interpDelayTicks, eventBuf);
 		PushInputToRing(encoded);
 		Packets.WriteInputPacketInto(_inputWriter, LastReceivedSnapshotTick, _inputRing, 0, _inputRingCount);
 		_server.Send(_inputWriter, NetServer.ChannelUnreliable, LiteNetLib.DeliveryMethod.Unreliable);
@@ -309,6 +328,9 @@ public class NetClient
 				break;
 			case PacketType.DropMag:
 				HandleDropMag(reader);
+				break;
+			case PacketType.GlassShatter:
+				HandleGlassShatter(reader);
 				break;
 			case PacketType.Hit:
 				HandleHit(reader);
@@ -669,6 +691,14 @@ public class NetClient
 		dot.GlobalPosition = worldPos;
 		var timer = tree.CreateTimer(5.0);
 		timer.Timeout += () => { if (Godot.GodotObject.IsInstanceValid(dot)) dot.QueueFree(); };
+	}
+
+	/// <summary>Resolves the target GlassPane by path and replays the authoritative fracture (deterministic seed).</summary>
+	private void HandleGlassShatter(NetPacketReader r)
+	{
+		Packets.ReadGlassShatter(r, out string panePath, out Vector3 point, out Vector3 dir, out int seed);
+		if (NetMain.Instance?.GetNodeOrNull(panePath) is GlassPane pane)
+			pane.Hit(point, dir, seed);
 	}
 
 	/// <summary>Routes a footstep to its puppet for spatial audio.</summary>

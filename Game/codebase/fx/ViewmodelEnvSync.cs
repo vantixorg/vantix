@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 
 namespace Vantix.Fx;
@@ -5,22 +22,18 @@ namespace Vantix.Fx;
 /// <summary>
 /// Copies the level WorldEnvironment's look (tonemap, adjustment + LUT, glow, ambient tint/energy)
 /// onto the viewmodel's own_world_3d Environment so the gun matches the map. Keeps the viewmodel's own
-/// setup (Sky ambient/reflection from WorldCaptureRig, SSAO, the light rig). Called once from NetMain
-/// after the local player spawns.
+/// setup (Sky ambient/reflection from WorldCaptureRig, SSAO, the light rig). Called at the end of
+/// Settings.Apply so it re-syncs whenever the world look changes (Bloom toggle, Brightness, etc.).
 /// </summary>
 public static class ViewmodelEnvSync
 {
 	/// <summary>Syncs viewmodel_env's look from the level WorldEnvironment. No-op if either env is missing.</summary>
-	public static void Sync(Node localPlayer, SceneTree tree)
+	public static void Sync(SceneTree tree)
 	{
-		if (localPlayer == null || tree?.Root == null) return;
-		Environment vm = FindViewmodelEnv(localPlayer);
+		if (tree?.Root == null) return;
+		Environment vm = FindViewmodelEnv(tree);
 		Environment world = FindWorldEnv(tree);
-		if (vm == null || world == null)
-		{
-			Dbg.Print($"[ViewmodelEnvSync] skipped — vmEnv={(vm != null)} worldEnv={(world != null)}");
-			return;
-		}
+		if (vm == null || world == null) return;
 
 		vm.TonemapMode = world.TonemapMode;
 		vm.TonemapExposure = world.TonemapExposure;
@@ -47,14 +60,12 @@ public static class ViewmodelEnvSync
 		// Match ambient tint/energy but keep the viewmodel's Sky ambient source (fed by the capture rig).
 		vm.AmbientLightColor = world.AmbientLightColor;
 		vm.AmbientLightEnergy = world.AmbientLightEnergy;
-
-		Dbg.Print("[ViewmodelEnvSync] synced viewmodel_env <- world env (tonemap + adjustment + glow + ambient)");
 	}
 
-	/// <summary>The Environment of the own_world_3d SubViewport under the local player (the viewmodel env).</summary>
-	private static Environment FindViewmodelEnv(Node root)
+	/// <summary>The Environment of the own_world_3d SubViewport (the viewmodel env).</summary>
+	private static Environment FindViewmodelEnv(SceneTree tree)
 	{
-		foreach (Node n in root.FindChildren("*", "SubViewport", true, false))
+		foreach (Node n in tree.Root.FindChildren("*", "SubViewport", true, false))
 		{
 			if (n is not SubViewport sv || !sv.OwnWorld3D) continue;
 			foreach (Node c in sv.GetChildren())

@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 using System.Collections.Generic;
 
@@ -6,6 +23,95 @@ namespace Vantix.Character;
 [Tool, GlobalClass]
 public partial class NetworkPlayer : CharacterBody3D
 {
+	private bool _tpsWasReloading, _tpsWasInspecting;
+	private static readonly StringName _pTpsActionRequest = "parameters/Action/request";
+
+	private GeometryInstance3D.ShadowCastingSetting? _tpsShadowModeApplied;
+
+	[ExportGroup("Grip")]
+	protected float HipFov => ConVars.Cl.Fov;
+	protected const float AdsFovDesignBase = 100f;
+	protected float AimFov => HipFov * ((_currentWeapon?.AimFov ?? 78f) / AdsFovDesignBase);
+	protected float TpsAimFov => _currentWeapon?.TpsAimFov ?? 50f;
+	protected Vector3 AdsOffsetPosition => _currentWeapon?.AdsOffsetPosition ?? new Vector3(-0.02f, 0.06f, 0.0205f);
+	protected Vector3 AdsOffsetRotation => _currentWeapon?.AdsOffsetRotation ?? new Vector3(0f, -8.4f, 0f);
+	protected float AimBlendSpeed => _currentWeapon?.AimBlendSpeed ?? 12f;
+	protected Vector3 CrouchOffsetPosition => _currentWeapon?.CrouchOffsetPosition ?? new Vector3(0.015f, 0.02f, -0.015f);
+	protected Vector3 CrouchOffsetRotation => _currentWeapon?.CrouchOffsetRotation ?? new Vector3(0f, 4.3f, 0f);
+	protected Vector3 CantedOffsetPosition => _currentWeapon?.CantedOffsetPosition ?? new Vector3(-0.05f, -0.015f, -0.01f);
+	protected Vector3 CantedOffsetRotation => _currentWeapon?.CantedOffsetRotation ?? new Vector3(0f, 35.0f, 0f);
+	protected bool AdsTestMode => _currentWeapon?.AdsTestMode ?? false;
+	protected bool CrouchTestMode => _currentWeapon?.CrouchTestMode ?? false;
+	protected bool CantedTestMode => _currentWeapon?.CantedTestMode ?? false;
+	protected float AdsCalibrationDistance => _currentWeapon?.AdsCalibrationDistance ?? 1.0f;
+	protected float AdsCalibrationSize => _currentWeapon?.AdsCalibrationSize ?? 0.004f;
+	protected Color AdsCalibrationColor => _currentWeapon?.AdsCalibrationColor ?? new Color(1f, 0f, 0f, 1f);
+	protected Vector3 RecoilImpulseHipfire => _currentWeapon?.RecoilImpulseHipfire ?? new Vector3(-1.2f, 0.4f, 0f);
+	protected Vector3 RecoilImpulseAimed => _currentWeapon?.RecoilImpulseAimed ?? new Vector3(-0.6f, 0.2f, 0f);
+	protected float RecoilStiffness => _currentWeapon?.RecoilStiffness ?? 200f;
+	protected float RecoilDamping => _currentWeapon?.RecoilDamping ?? 0.6f;
+	protected float RecoilMass => _currentWeapon?.RecoilMass ?? 1f;
+	protected float RecoilMaxDegrees => _currentWeapon?.RecoilMaxDegrees ?? 10f;
+	protected float AimRecoilMultiplier => _currentWeapon?.AimRecoilMultiplier ?? 0.5f;
+	protected float WeaponRecoilRotScale => _currentWeapon?.WeaponRecoilRotScale ?? 0.35f;
+	protected float WeaponRecoilKickback => _currentWeapon?.WeaponRecoilKickback ?? 0.012f;
+
+	protected AnimationPlayer _player;
+	protected bool _isAiming;
+	protected bool _isCrouched;
+	protected float _lookYaw;
+	protected float _lookPitch;
+	protected float _aimBlend;
+	protected bool _cantedAim;
+	protected Vector3 _recoilCurrent;
+	protected Camera3D _cam;
+	protected Camera3D _viewmodelCam;
+	protected Camera3D _tpsCam;
+	protected Node3D _tpsPivot;
+	protected float _tpsZoomDist = -1f;
+	protected PhysicsRayQueryParameters3D _tpsRayQuery;
+	protected readonly PhysicsRayQueryResult3D _tpsRayResult = new();
+	protected Godot.Collections.Array<Rid> _tpsSelfExclude;
+	protected Node3D _viewmodelCamAnchor;
+	protected CanvasLayer _viewmodelLayer;
+	protected AnimationPlayer _tpsPlayer;
+	protected AnimationTree _tpsTree;
+	protected AnimationNodeAnimation _tpsActionAnim;
+	protected AnimationNodeAnimation _tpsAimPoseNode;
+	protected TpsAimModifier _tpsAimModifier;
+
+	protected BotController _botController;
+	protected WeaponAnimation _currentWeapon;
+	protected WeaponAnimation _fpsWeapon;
+	protected WeaponAnimation _tpsWeapon;
+	protected float _magFill = 1f;
+	protected string _fireModeName = "Semi";
+	protected FootstepAudio _footstepAudio;
+	protected AnimationTree _tree;
+	protected AnimationNodeAnimation _actionAnim;
+	protected AnimationNodeAnimation _actionRefNode;
+	protected AnimationNodeAnimation _actionRef2Node;
+	protected AnimationNodeAnimation _tpsActionRefNode;
+	protected AnimationNodeAnimation _tpsActionRef2Node;
+	protected AnimationNodeAnimation _gripPose;
+	protected AnimationNodeAnimation _gripPoseAim;
+	protected GripType _grip = GripType.Standard;
+	protected Vector2 _simVel;
+	protected float _runAmt, _sprintAmt;
+	protected float _smoothedHorizSpeed;
+	protected Node3D _leftHandFabrik;
+	protected Node3D _rightHandFabrik;
+	protected WeaponBoneModifier _weaponBoneModifier;
+	protected Node3D _bodyNode;
+	protected Vector3 _bodyRest;
+	protected bool _bodyRestCaptured;
+
+	protected AnimationNodeAnimation _locoStopAnim;
+	protected string _animEnumHint;
+	protected string _tpsAnimEnumHint;
+
+	protected bool TpsView => CurrentGameMode != PresentationMode.Server && ViewMode == ViewMode.Tps && _tpsCam != null;
+
 	[ExportGroup("Mode")]
 	[Export]
 	public PresentationMode CurrentGameMode = PresentationMode.Local;
@@ -73,8 +179,6 @@ public partial class NetworkPlayer : CharacterBody3D
 	[Export]
 	public Node3D TpsVisual;
 
-	// Character-rig aim-pitch posing (which spine bone twists, how much) — runs server-side and on
-	// puppets, so it's rig data, not weapon data. Per-weapon ADS zoom (TpsAimFov) lives on WeaponAnimation.
 	[ExportSubgroup("Aim Posing")]
 	[Export]
 	public string TpsAimBoneName = "spine_03";
@@ -318,9 +422,6 @@ public partial class NetworkPlayer : CharacterBody3D
 	[Export]
 	public string TpsIdlePoseGripVertical = "poses/A_TFA_TP_AR_Idle_Pose_Grip_Vertical";
 
-	[ExportGroup("Grip")]
-	/// <summary>Hip-fire FOV = the live user setting. AimFov is blended in on ADS.</summary>
-	protected float HipFov => ConVars.Cl.Fov;
 	[Export(PropertyHint.Range, "1,60,0.5")]
 	public float GripPoseBlendSpeed = 15f;
 	[Export(PropertyHint.Range, "0.05,0.5,0.005")]
@@ -408,36 +509,6 @@ public partial class NetworkPlayer : CharacterBody3D
 	[Export(PropertyHint.Range, "0,2,0.05")]
 	public float MouseInertiaRollMul = 0.18f;
 
-	/// <summary>ADS FOV is relative: per-weapon AimFov is authored against a 100° base and scaled by HipFov,
-	/// so the zoom factor stays constant at any FOV setting.</summary>
-	protected const float AdsFovDesignBase = 100f;
-	protected float AimFov => HipFov * ((_currentWeapon?.AimFov ?? 78f) / AdsFovDesignBase);
-	protected float TpsAimFov => _currentWeapon?.TpsAimFov ?? 50f;
-	protected Vector3 AdsOffsetPosition => _currentWeapon?.AdsOffsetPosition ?? new Vector3(-0.02f, 0.06f, 0.0205f);
-	protected Vector3 AdsOffsetRotation => _currentWeapon?.AdsOffsetRotation ?? new Vector3(0f, -8.4f, 0f);
-	// Per-weapon ADS/crouch/canted calibration lives on WeaponAnimation; read here and composed with the
-	// character's own blend state. Editor preview polls AdsTestMode/AdsCalibration* the same way.
-	protected float AimBlendSpeed => _currentWeapon?.AimBlendSpeed ?? 12f;
-	protected Vector3 CrouchOffsetPosition => _currentWeapon?.CrouchOffsetPosition ?? new Vector3(0.015f, 0.02f, -0.015f);
-	protected Vector3 CrouchOffsetRotation => _currentWeapon?.CrouchOffsetRotation ?? new Vector3(0f, 4.3f, 0f);
-	protected Vector3 CantedOffsetPosition => _currentWeapon?.CantedOffsetPosition ?? new Vector3(-0.05f, -0.015f, -0.01f);
-	protected Vector3 CantedOffsetRotation => _currentWeapon?.CantedOffsetRotation ?? new Vector3(0f, 35.0f, 0f);
-	protected bool AdsTestMode => _currentWeapon?.AdsTestMode ?? false;
-	protected bool CrouchTestMode => _currentWeapon?.CrouchTestMode ?? false;
-	protected bool CantedTestMode => _currentWeapon?.CantedTestMode ?? false;
-	protected float AdsCalibrationDistance => _currentWeapon?.AdsCalibrationDistance ?? 1.0f;
-	protected float AdsCalibrationSize => _currentWeapon?.AdsCalibrationSize ?? 0.004f;
-	protected Color AdsCalibrationColor => _currentWeapon?.AdsCalibrationColor ?? new Color(1f, 0f, 0f, 1f);
-	protected Vector3 RecoilImpulseHipfire => _currentWeapon?.RecoilImpulseHipfire ?? new Vector3(-1.2f, 0.4f, 0f);
-	protected Vector3 RecoilImpulseAimed => _currentWeapon?.RecoilImpulseAimed ?? new Vector3(-0.6f, 0.2f, 0f);
-	protected float RecoilStiffness => _currentWeapon?.RecoilStiffness ?? 200f;
-	protected float RecoilDamping => _currentWeapon?.RecoilDamping ?? 0.6f;
-	protected float RecoilMass => _currentWeapon?.RecoilMass ?? 1f;
-	protected float RecoilMaxDegrees => _currentWeapon?.RecoilMaxDegrees ?? 10f;
-	protected float AimRecoilMultiplier => _currentWeapon?.AimRecoilMultiplier ?? 0.5f;
-	protected float WeaponRecoilRotScale => _currentWeapon?.WeaponRecoilRotScale ?? 0.35f;
-	protected float WeaponRecoilKickback => _currentWeapon?.WeaponRecoilKickback ?? 0.012f;
-
 	[ExportGroup("IK")]
 	[ExportSubgroup("Left Hand (Foregrip)")]
 	[Export]
@@ -493,61 +564,18 @@ public partial class NetworkPlayer : CharacterBody3D
 	/// <summary>Foregrip style affecting the hand pose.</summary>
 	public enum GripType { Standard, Angled, Vertical }
 
-	protected AnimationPlayer _player;
-	protected bool _isAiming;
-	protected bool _isCrouched;
-	protected float _lookYaw;
-	protected float _lookPitch;
-	protected float _aimBlend;
-	protected bool _cantedAim;
-	protected Vector3 _recoilCurrent;
-	protected Camera3D _cam;
-	protected Camera3D _viewmodelCam;
-	protected Camera3D _tpsCam;
-	protected Node3D _tpsPivot;
-	protected float _tpsZoomDist = -1f;
-	protected PhysicsRayQueryParameters3D _tpsRayQuery;
-	protected readonly PhysicsRayQueryResult3D _tpsRayResult = new();
-	protected Godot.Collections.Array<Rid> _tpsSelfExclude;
-	protected Node3D _viewmodelCamAnchor;
-	protected CanvasLayer _viewmodelLayer;
-	protected AnimationPlayer _tpsPlayer;
-	protected AnimationTree _tpsTree;
-	protected AnimationNodeAnimation _tpsActionAnim;
-	protected AnimationNodeAnimation _tpsAimPoseNode;
-	protected TpsAimModifier _tpsAimModifier;
-
-	protected BotController _botController;
 	public BotController BotController => _botController ??= new();
 
-	protected WeaponAnimation _currentWeapon;
-	protected WeaponAnimation _fpsWeapon;
-	protected WeaponAnimation _tpsWeapon;
-	protected float _magFill = 1f;
-	protected string _fireModeName = "Semi";
-	protected FootstepAudio _footstepAudio;
-	protected AnimationTree _tree;
-	protected AnimationNodeAnimation _actionAnim;
-	protected AnimationNodeAnimation _actionRefNode;
-	protected AnimationNodeAnimation _actionRef2Node;
-	protected AnimationNodeAnimation _tpsActionRefNode;
-	protected AnimationNodeAnimation _tpsActionRef2Node;
-	protected AnimationNodeAnimation _gripPose;
-	protected AnimationNodeAnimation _gripPoseAim;
-	protected GripType _grip = GripType.Standard;
-	protected Vector2 _simVel;
-	protected float _runAmt, _sprintAmt;
-	protected float _smoothedHorizSpeed;
-	protected Node3D _leftHandFabrik;
-	protected Node3D _rightHandFabrik;
-	protected WeaponBoneModifier _weaponBoneModifier;
-	protected Node3D _bodyNode;
-	protected Vector3 _bodyRest;
-	protected bool _bodyRestCaptured;
+	public Camera3D ActiveCamera =>
+		(ViewMode == ViewMode.Tps && _tpsCam != null) ? _tpsCam : _cam;
 
-	protected AnimationNodeAnimation _locoStopAnim;
-	protected string _animEnumHint;
-	protected string _tpsAnimEnumHint;
+	private void FireTpsAction(string anim)
+	{
+		if (string.IsNullOrEmpty(anim) || !_tpsPlayer.HasAnimation(anim))
+			return;
+		_tpsActionAnim.Animation = anim;
+		_tpsTree.Set(_pTpsActionRequest, (int)AnimationNodeOneShot.OneShotRequest.Fire);
+	}
 
 	protected void ResolveWeaponPlayers()
 	{
@@ -576,12 +604,10 @@ public partial class NetworkPlayer : CharacterBody3D
 		UpdateActiveWeapon();
 	}
 
-	protected bool TpsView => CurrentGameMode != PresentationMode.Server && ViewMode == ViewMode.Tps && _tpsCam != null;
-
 	protected void UpdateActiveWeapon()
 	{
 		WeaponAnimation target = CurrentGameMode == PresentationMode.Server ? null
-			: IsPuppet ? _tpsWeapon                       // puppets only ever show the TPS body
+			: IsPuppet ? _tpsWeapon
 			: TpsView && _tpsWeapon != null ? _tpsWeapon
 			: _fpsWeapon;
 		if (target == _currentWeapon)
@@ -601,8 +627,6 @@ public partial class NetworkPlayer : CharacterBody3D
 	{
 		if (_tpsPivot == null || _tpsCam == null)
 			return;
-		// tps_pivot is a child of the body, which HandleMouseLook already yaws, so the pivot inherits the
-		// look yaw and only adds pitch locally. Adding _lookYaw here too double-rotated the camera (2×yaw).
 		_tpsPivot.Rotation = new Vector3(
 			Mathf.DegToRad(TpsBasePitchDeg) + (MouseLookEnabled ? _lookPitch : 0f),
 			0f,
@@ -666,11 +690,6 @@ public partial class NetworkPlayer : CharacterBody3D
 			_tpsAimPoseNode.Animation = pose;
 	}
 
-	private bool _tpsWasReloading, _tpsWasInspecting;
-	private static readonly StringName _pTpsActionRequest = "parameters/Action/request";
-
-	/// <summary>Fires the TPS reload/inspect one-shot on the rising edge. Puppets read the replicated
-	/// snapshot flags; the local TPS body reads its own sim.</summary>
 	protected void UpdateTpsMontages()
 	{
 		if (_tpsTree == null || _tpsActionAnim == null || _tpsPlayer == null)
@@ -686,14 +705,6 @@ public partial class NetworkPlayer : CharacterBody3D
 		_tpsWasInspecting = inspecting;
 	}
 
-	private void FireTpsAction(string anim)
-	{
-		if (string.IsNullOrEmpty(anim) || !_tpsPlayer.HasAnimation(anim))
-			return;
-		_tpsActionAnim.Animation = anim;
-		_tpsTree.Set(_pTpsActionRequest, (int)AnimationNodeOneShot.OneShotRequest.Fire);
-	}
-
 	protected void ApplyModeVisibility()
 	{
 		bool server = CurrentGameMode == PresentationMode.Server;
@@ -707,15 +718,25 @@ public partial class NetworkPlayer : CharacterBody3D
 			if (GodotObject.IsInstanceValid(_viewmodelCam)) _viewmodelCam.Current = true;
 		}
 		if (GodotObject.IsInstanceValid(_viewmodelLayer)) _viewmodelLayer.Visible = fps;
-		if (GodotObject.IsInstanceValid(TpsVisual)) TpsVisual.Visible = !server && (!local || tps);
-		// Local player in FPS view: TPS body is hidden, so don't animate it — otherwise the full skeleton +
-		// AnimationTree + aim modifier process every frame (engine-side cost, invisible to the C# profiler).
-		// Re-enabled when spectating through the TPS cam.
+		bool tpsToCamera = !server && (!local || tps);
+		bool tpsShadowOnly = fps;
+		if (GodotObject.IsInstanceValid(TpsVisual))
+		{
+			TpsVisual.Visible = tpsToCamera || tpsShadowOnly;
+			var shadowMode = tpsShadowOnly && !tpsToCamera
+				? GeometryInstance3D.ShadowCastingSetting.ShadowsOnly
+				: GeometryInstance3D.ShadowCastingSetting.On;
+			if (_tpsShadowModeApplied != shadowMode)
+			{
+				_tpsShadowModeApplied = shadowMode;
+				SetCastShadowRecursive(TpsVisual, shadowMode);
+			}
+		}
 		if (local)
 		{
-			bool tpsBodyShown = tps;
-			if (TpsAnimTree != null && TpsAnimTree.Active != tpsBodyShown) TpsAnimTree.Active = tpsBodyShown;
-			if (AimModifier != null && AimModifier.Active != tpsBodyShown) AimModifier.Active = tpsBodyShown;
+			bool tpsBodyActive = tps || tpsShadowOnly;
+			if (TpsAnimTree != null && TpsAnimTree.Active != tpsBodyActive) TpsAnimTree.Active = tpsBodyActive;
+			if (AimModifier != null && AimModifier.Active != tpsBodyActive) AimModifier.Active = tpsBodyActive;
 		}
 		UpdateActiveWeapon();
 	}
@@ -733,14 +754,23 @@ public partial class NetworkPlayer : CharacterBody3D
 			SetRenderLayersRecursive(c, layer);
 	}
 
+	protected static void SetCastShadowRecursive(Node n, GeometryInstance3D.ShadowCastingSetting mode)
+	{
+		if (n is GeometryInstance3D gi) gi.CastShadow = mode;
+		foreach (Node c in n.GetChildren())
+			SetCastShadowRecursive(c, mode);
+	}
+
 	protected (string key, Vector2 pos)[] StandPoints() => new[] {
 		(IdleStanding, new Vector2(0, 0)), (WalkForward, new Vector2(0, 100)), (WalkBackward, new Vector2(0, -100)),
 		(WalkStrafeLeft, new Vector2(-100, 0)), (WalkStrafeRight, new Vector2(100, 0)),
 	};
+
 	protected (string key, Vector2 pos)[] AimPoints() => new[] {
 		(IdleAimed, new Vector2(0, 0)), (WalkForwardAimed, new Vector2(0, 100)), (WalkBackwardAimed, new Vector2(0, -100)),
 		(WalkStrafeLeftAimed, new Vector2(-100, 0)), (WalkStrafeRightAimed, new Vector2(100, 0)),
 	};
+
 	protected (string key, Vector2 pos)[] CrouchPoints() => new[] {
 		(IdleCrouched, new Vector2(0, 0)), (WalkForward, new Vector2(0, 100)), (WalkBackward, new Vector2(0, -100)),
 		(WalkStrafeLeft, new Vector2(-100, 0)), (WalkStrafeRight, new Vector2(100, 0)),
@@ -931,7 +961,11 @@ public partial class NetworkPlayer : CharacterBody3D
 		return string.Join(",", list);
 	}
 
+	protected void ApplyViewMode() => ApplyModeVisibility();
 
+	protected virtual void ApplyEditorPreview(float dt = 0f) { }
+
+	/// <summary>Builds the sim, weapon and animation rig, then applies per-mode visibility.</summary>
 	public override void _Ready()
 	{
 		SetProcess(true);
@@ -947,9 +981,9 @@ public partial class NetworkPlayer : CharacterBody3D
 		{
 			_player = GetNodeOrNull<AnimationPlayer>(CharacterAnimationPath);
 			ResolveWeaponPlayers();
-			BuildAnimationTree();        // FPS arms blend tree (viewmodel)
-			BuildTpsTree();              // TPS body blend tree
-			PreWarmAnimationOneShots(_tree);   // pre-fire FPS one-shots so the first shot doesn't hitch
+			BuildAnimationTree();
+			BuildTpsTree();
+			PreWarmAnimationOneShots(_tree);
 			ApplyViewmodelLayer();
 		}
 		ApplyModeVisibility();
@@ -957,15 +991,7 @@ public partial class NetworkPlayer : CharacterBody3D
 			Input.MouseMode = Input.MouseModeEnum.Captured;
 	}
 
-	public Camera3D ActiveCamera =>
-		(ViewMode == ViewMode.Tps && _tpsCam != null) ? _tpsCam : _cam;
-
-	protected void ApplyViewMode() => ApplyModeVisibility();
-
-	/// <summary>[Tool] editor preview of the FPS view. LocalPlayer overrides; base no-op.</summary>
-	protected virtual void ApplyEditorPreview(float dt = 0f) { }
-
-
+	/// <summary>Editor: shows the animation-name string fields as enum dropdowns.</summary>
 	public override void _ValidateProperty(Godot.Collections.Dictionary property)
 	{
 		var type = (Variant.Type)property["type"].AsInt64();
@@ -973,7 +999,7 @@ public partial class NetworkPlayer : CharacterBody3D
 		if (type != Variant.Type.String || !usage.HasFlag(PropertyUsageFlags.ScriptVariable))
 			return;
 		string name = (string)property["name"];
-		if (name.EndsWith("BoneName"))   // bone names are not animation clips
+		if (name.EndsWith("BoneName"))
 			return;
 		string hint = name.StartsWith("Tps") ? GetTpsAnimationEnumHint() : GetAnimationEnumHint();
 		if (!string.IsNullOrEmpty(hint))
@@ -983,6 +1009,7 @@ public partial class NetworkPlayer : CharacterBody3D
 		}
 	}
 
+	/// <summary>Adds a recoil kick in degrees, clamped to RecoilMaxDegrees.</summary>
 	public void AddRecoilKick(Vector3 degreesXYZ)
 	{
 		_recoilCurrent += degreesXYZ;
@@ -990,5 +1017,4 @@ public partial class NetworkPlayer : CharacterBody3D
 		if (mag > RecoilMaxDegrees)
 			_recoilCurrent = _recoilCurrent * (RecoilMaxDegrees / mag);
 	}
-
 }

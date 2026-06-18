@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 
 namespace Vantix.Character;
@@ -53,8 +70,6 @@ public partial class ServerPlayer : NetworkPlayer
 		};
 	}
 
-	/// <summary>Lag-compensated hitscan: other players' hitboxes are rewound to their historical positions
-	/// before the cast. On a hit, applies damage, triggers death at HP 0, and broadcasts ShotFired.</summary>
 	private void RunAuthoritativeHitscan(PhysicsDirectSpaceState3D space)
 	{
 		var server = NetMain.Instance?.Server;
@@ -62,8 +77,14 @@ public partial class ServerPlayer : NetworkPlayer
 		var myState = server.GetPeerStateForNetId(NetId);
 		int rttMs = myState?.LastPingMs ?? 0;
 		int halfRttTicks = Mathf.Clamp((rttMs * TickRate) / 2000, 0, 64);
-		const int InterpDelayTicks = 6;
-		long target = (long)CurrentTick - halfRttTicks - InterpDelayTicks;
+		const int DefaultInterpDelayTicks = 6;
+		int interpDelayTicks = myState != null && myState.HasLatestInput
+			? myState.LatestInput.InterpDelayTicks
+			: DefaultInterpDelayTicks;
+		int maxUnlagTicks = Mathf.Clamp(ConVars.Sv.MaxUnlagTicks, 0, BonePoseRewindBuffer.BufferSize);
+		int rewindTicks = Mathf.Clamp(halfRttTicks + interpDelayTicks, 0, maxUnlagTicks);
+		NetStats.LagCompRewindTicks = rewindTicks;
+		long target = (long)CurrentTick - rewindTicks;
 		uint lagCompTick = (uint)Mathf.Max(0L, target);
 		byte fireSubTick = myState != null && myState.HasLatestInput ? myState.LatestInput.FireSubTick : (byte)0;
 		float fractionalLagCompTick = (float)lagCompTick + (fireSubTick / 256f);
@@ -182,10 +203,22 @@ public partial class ServerPlayer : NetworkPlayer
 			tracer: true,
 			lagHit.Hit, lagHit.Position, lagHit.Normal,
 			lagHit.Material.ToString());
+
+		ResolveGlassShatter(space, server, maxDist);
 	}
 
-	/// <summary>True if an opaque wall (not in group "wallhit") sits between eye and impact.
-	/// Steps through penetrable walls (e.g. glass), capped at MaxPenetrableChain.</summary>
+	private const uint GlassMask = 32u;
+
+	private void ResolveGlassShatter(PhysicsDirectSpaceState3D space, NetServer server, float maxDist)
+	{
+		HitInfo glass = Hitscan.Cast(space, Movement.LastShotOrigin, Movement.LastShotDirection,
+			HitscanRange, exclude: GetRid(), mask: GlassMask);
+		if (!glass.Hit || glass.Collider is not GlassPane pane) return;
+		if (glass.Distance > maxDist + 0.25f) return;
+		int seed = (int)GD.Randi();
+		server.BroadcastGlassShatter(pane.GetPath().ToString(), glass.Position, Movement.LastShotDirection, seed);
+	}
+
 	private bool IsHitObstructedByOpaqueWall(PhysicsDirectSpaceState3D space, Vector3 from, Vector3 to)
 	{
 		if (space == null) return false;
@@ -208,8 +241,6 @@ public partial class ServerPlayer : NetworkPlayer
 		return false;
 	}
 
-	/// <summary>Non-headless only: adds an eye-level camera under the head and shows the body so the
-	/// operator sees what the player sees. The first server body claims the active camera.</summary>
 	private void SetupServerSpectateCamera()
 	{
 		if (TpsVisual != null) TpsVisual.Visible = true;
@@ -236,8 +267,6 @@ public partial class ServerPlayer : NetworkPlayer
 		ViewMode = ViewMode.Disabled;
 		ApplyViewMode();
 
-		// Headless renders nothing, so free the body meshes. Non-headless keeps them and adds an
-		// eye-level camera for the operator.
 		if (DisplayServer.GetName() == "headless")
 			DisableExpensiveSubtreeProcessing();
 		else

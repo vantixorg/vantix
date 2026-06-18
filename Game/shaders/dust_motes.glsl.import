@@ -1,0 +1,14 @@
+[remap]
+
+importer="glsl"
+type="RDShaderFile"
+uid="uid://lh8uvlhx5xby"
+path="res://.godot/imported/dust_motes.glsl-a3ffccb4689b611ce936d543a2de6845.res"
+
+[deps]
+
+source_file="res://shaders/dust_motes.glsl"
+dest_files=["res://.godot/imported/dust_motes.glsl-a3ffccb4689b611ce936d543a2de6845.res"]
+
+[params]
+

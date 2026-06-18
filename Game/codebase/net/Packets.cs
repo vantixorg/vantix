@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 using LiteNetLib;
 using LiteNetLib.Utils;
@@ -13,8 +30,9 @@ public static class Packets
 	/// v2: snapshot Pos/Vel cm-quantised int16; material a byte id. v3: delta-baseline snapshot compression
 	/// (baselineTick + per-player field mask; input carries ackedSnapshotTick). v4: input redundancy (N bodies,
 	/// dedupe by tickIndex). v5: subtick fire-timing (FireSubTick byte). v6: subtick movement (InitialBits +
-	/// initial yaw/pitch + EventCount + N SubtickEvents).</summary>
-	public const ushort ProtocolVersion = 6;
+	/// initial yaw/pitch + EventCount + N SubtickEvents). v7: input carries InterpDelayTicks (lag-comp).
+	/// v8: GlassShatter packet (pane path + point/dir + seed).</summary>
+	public const ushort ProtocolVersion = 8;
 
 	/// <summary>Hard wire cap on subtick events per input body. Must match NetworkPlayer.MaxSubtickEventsPerTick;
 	/// server rejects higher counts (cheat + bandwidth guard).</summary>
@@ -253,7 +271,7 @@ public static class Packets
 	/// must outlive the struct's stay in the redundancy ring.</summary>
 	public static EncodedInput EncodeInput(uint tickIndex, in MovementInput mi,
 		bool firePressed, bool reloadPressed, bool inspectPressed, bool slotIsGrenade,
-		byte fireSubTick, SubtickEventEncoded[] eventBuffer = null)
+		byte fireSubTick, byte interpDelayTicks, SubtickEventEncoded[] eventBuffer = null)
 	{
 		byte f1 = 0;
 		if (mi.SprintHeld)     f1 |= 1 << 0;
@@ -302,6 +320,7 @@ public static class Packets
 			Flags1 = f1,
 			Flags2 = f2,
 			FireSubTick = firePressed ? fireSubTick : (byte)0,
+			InterpDelayTicks = interpDelayTicks,
 			InitialBits = (ushort)mi.InitialBits,
 			QInitialYaw = QuantizeYaw(mi.InitialViewYaw),
 			QInitialPitch = QuantizePitch(mi.InitialViewPitch),
@@ -333,6 +352,7 @@ public static class Packets
 		w.Put(e.Flags1);
 		w.Put(e.Flags2);
 		w.Put(e.FireSubTick);
+		w.Put(e.InterpDelayTicks);
 		w.Put(e.InitialBits);
 		w.Put(e.QInitialYaw);
 		w.Put(e.QInitialPitch);
@@ -378,6 +398,7 @@ public static class Packets
 		pkt.InspectPressed = (f2 & (1 << 1)) != 0;
 		pkt.SlotIsGrenade  = (f2 & (1 << 2)) != 0;
 		pkt.FireSubTick    = r.GetByte();
+		pkt.InterpDelayTicks = r.GetByte();
 
 		pkt.InitialBits = r.GetUShort();
 		pkt.InitialViewYaw = DequantizeYaw(r.GetUShort());
@@ -596,6 +617,26 @@ public static class Packets
 			hitNormal = default;
 			material = "default";
 		}
+	}
+
+	/// <summary>Writes a GlassShatter packet — target pane node path, impact point, direction, deterministic seed.</summary>
+	public static NetDataWriter WriteGlassShatter(string panePath, Vector3 point, Vector3 dir, int seed)
+	{
+		var w = Begin(PacketType.GlassShatter);
+		w.Put(panePath);
+		w.PutVec3(point);
+		w.PutVec3(dir);
+		w.Put(seed);
+		return w;
+	}
+
+	/// <summary>Reads a GlassShatter packet (pane path + impact point/dir + seed).</summary>
+	public static void ReadGlassShatter(NetPacketReader r, out string panePath, out Vector3 point, out Vector3 dir, out int seed)
+	{
+		panePath = r.GetString();
+		point = r.GetVec3();
+		dir = r.GetVec3();
+		seed = r.GetInt();
 	}
 
 	/// <summary>Writes a Hit packet (shooter, victim, hitbox group, damage, hp left, weapon).</summary>

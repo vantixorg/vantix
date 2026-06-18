@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 using System;
 
@@ -42,9 +59,8 @@ public static class Settings
 	/// <summary>Master switch for the compute-shader post-process pass; Off kills the whole PostProcessEffect
 	/// dispatch (the toggles below only gate sub-effects).</summary>
 	public static bool PostProcessing = true;
-	/// <summary>Max distance (m) cloud shadows render before fading. 0 = camera vicinity only, 250+ = whole map.</summary>
-	public static bool GodRays = true;
 	public static bool LensFlare = true;
+	public static bool Bloom = true;
 	public static bool DustMotes = true;
 	public static bool MotionBlur = true;
 	public static bool FilmGrain = true;
@@ -52,6 +68,9 @@ public static class Settings
 	public static bool ChromaticAberration = true;
 	/// <summary>Luma-only unsharp-mask pass. Auto-disabled under FSR (its RCAS already sharpens — stacking oversharpens).</summary>
 	public static bool Sharpening = true;
+	public static bool EyeAdaptation = false;
+	public static bool Purkinje = false;
+	public static bool CinematicBands = false;
 	/// <summary>Canvas-stage sharpen on the Bilinear pipeline when the frame isn't softened by TAA or a sub-native upscale.</summary>
 	private const float BaseSharpen = 0.25f;
 	/// <summary>Canvas-stage sharpen when the Bilinear output is soft (TAA + sub-native upscale). Applied in
@@ -104,8 +123,8 @@ public static class Settings
 		VolumetricFog = VolumetricFogQuality.Low;
 		Sky = false;
 		CloudShadows = false;
-		GodRays = false;
 		LensFlare = false;
+		Bloom = false;
 		DustMotes = false;
 		MotionBlur = false;
 		FilmGrain = false;
@@ -129,7 +148,7 @@ public static class Settings
 				RenderScale = 0.50f; ViewmodelRenderScale = 1.0f; Upscaler = UpscalingMode.Fsr2; AntiAliasing = AntiAliasingMode.Smaa;
 				Shadows = ShadowQuality.Low; Anisotropy = AnisotropicFiltering.X2; AmbientOcclusion = false;
 				Reflections = false; ReflectionProbes = ReflectionProbeQuality.Low; VolumetricFog = VolumetricFogQuality.Low;
-				Sky = true; CloudShadows = false; GodRays = false; LensFlare = false; DustMotes = false;
+				Sky = true; CloudShadows = false; LensFlare = false; Bloom = true; DustMotes = false;
 				MotionBlur = false; FilmGrain = false; Vignette = false; AdsDepthOfField = false;
 				ViewBob = false; SprintSway = false; MouseInertia = false; DirectionLean = false; CameraShake = false;
 				break;
@@ -137,7 +156,7 @@ public static class Settings
 				RenderScale = 0.75f; ViewmodelRenderScale = 1.5f; Upscaler = UpscalingMode.Fsr2; AntiAliasing = AntiAliasingMode.Taa;
 				Shadows = ShadowQuality.Medium; Anisotropy = AnisotropicFiltering.X4; AmbientOcclusion = true;
 				Reflections = false; ReflectionProbes = ReflectionProbeQuality.Medium; VolumetricFog = VolumetricFogQuality.Low;
-				Sky = true; CloudShadows = true; GodRays = false; LensFlare = true; DustMotes = false;
+				Sky = true; CloudShadows = true; LensFlare = true; Bloom = true; DustMotes = false;
 				MotionBlur = true; FilmGrain = false; Vignette = true; AdsDepthOfField = true;
 				ViewBob = true; SprintSway = true; MouseInertia = true; DirectionLean = true; CameraShake = true;
 				break;
@@ -145,7 +164,7 @@ public static class Settings
 				RenderScale = 0.85f; ViewmodelRenderScale = 1.5f; Upscaler = UpscalingMode.Fsr2; AntiAliasing = AntiAliasingMode.Taa;
 				Shadows = ShadowQuality.High; Anisotropy = AnisotropicFiltering.X8; AmbientOcclusion = true;
 				Reflections = true; ReflectionProbes = ReflectionProbeQuality.High; VolumetricFog = VolumetricFogQuality.Medium;
-				Sky = true; CloudShadows = true; GodRays = true; LensFlare = true; DustMotes = true;
+				Sky = true; CloudShadows = true; LensFlare = true; Bloom = true; DustMotes = true;
 				MotionBlur = true; FilmGrain = true; Vignette = true; AdsDepthOfField = true;
 				ViewBob = true; SprintSway = true; MouseInertia = true; DirectionLean = true; CameraShake = true;
 				break;
@@ -153,7 +172,7 @@ public static class Settings
 				RenderScale = 1.0f; ViewmodelRenderScale = 2.0f; Upscaler = UpscalingMode.Bilinear; AntiAliasing = AntiAliasingMode.Taa;
 				Shadows = ShadowQuality.High; Anisotropy = AnisotropicFiltering.X16; AmbientOcclusion = true;
 				Reflections = true; ReflectionProbes = ReflectionProbeQuality.Ultra; VolumetricFog = VolumetricFogQuality.High;
-				Sky = true; CloudShadows = true; GodRays = true; LensFlare = true; DustMotes = true;
+				Sky = true; CloudShadows = true; LensFlare = true; Bloom = true; DustMotes = true;
 				MotionBlur = true; FilmGrain = true; Vignette = true; AdsDepthOfField = true;
 				ViewBob = true; SprintSway = true; MouseInertia = true; DirectionLean = true; CameraShake = true;
 				break;
@@ -199,14 +218,17 @@ public static class Settings
 		Sky = cfg.GetValue("graphics", "sky", Sky).AsBool();
 		CloudShadows = cfg.GetValue("graphics", "cloud_shadows", CloudShadows).AsBool();
 		PostProcessing = cfg.GetValue("graphics", "post_processing", PostProcessing).AsBool();
-		GodRays = cfg.GetValue("graphics", "god_rays", GodRays).AsBool();
 		LensFlare = cfg.GetValue("graphics", "lens_flare", LensFlare).AsBool();
+		Bloom = cfg.GetValue("graphics", "bloom", Bloom).AsBool();
 		DustMotes = cfg.GetValue("graphics", "dust_motes", DustMotes).AsBool();
 		MotionBlur = cfg.GetValue("graphics", "motion_blur", MotionBlur).AsBool();
 		FilmGrain = cfg.GetValue("graphics", "film_grain", FilmGrain).AsBool();
 		Vignette = cfg.GetValue("graphics", "vignette", Vignette).AsBool();
 		ChromaticAberration = cfg.GetValue("graphics", "chromatic_aberration", ChromaticAberration).AsBool();
 		Sharpening = cfg.GetValue("graphics", "sharpening", Sharpening).AsBool();
+		EyeAdaptation = cfg.GetValue("graphics", "eye_adaptation", EyeAdaptation).AsBool();
+		Purkinje = cfg.GetValue("graphics", "purkinje", Purkinje).AsBool();
+		CinematicBands = cfg.GetValue("graphics", "cinematic_bands", CinematicBands).AsBool();
 		AdsDepthOfField = cfg.GetValue("graphics", "ads_dof", AdsDepthOfField).AsBool();
 		AdsFovZoom = cfg.GetValue("graphics", "ads_fov_zoom", AdsFovZoom).AsBool();
 		AutoExposure = cfg.GetValue("graphics", "auto_exposure", AutoExposure).AsBool();
@@ -270,14 +292,17 @@ public static class Settings
 		cfg.SetValue("graphics", "sky", Sky);
 		cfg.SetValue("graphics", "cloud_shadows", CloudShadows);
 		cfg.SetValue("graphics", "post_processing", PostProcessing);
-		cfg.SetValue("graphics", "god_rays", GodRays);
 		cfg.SetValue("graphics", "lens_flare", LensFlare);
+		cfg.SetValue("graphics", "bloom", Bloom);
 		cfg.SetValue("graphics", "dust_motes", DustMotes);
 		cfg.SetValue("graphics", "motion_blur", MotionBlur);
 		cfg.SetValue("graphics", "film_grain", FilmGrain);
 		cfg.SetValue("graphics", "vignette", Vignette);
 		cfg.SetValue("graphics", "chromatic_aberration", ChromaticAberration);
 		cfg.SetValue("graphics", "sharpening", Sharpening);
+		cfg.SetValue("graphics", "eye_adaptation", EyeAdaptation);
+		cfg.SetValue("graphics", "purkinje", Purkinje);
+		cfg.SetValue("graphics", "cinematic_bands", CinematicBands);
 		cfg.SetValue("graphics", "ads_dof", AdsDepthOfField);
 		cfg.SetValue("graphics", "ads_fov_zoom", AdsFovZoom);
 		cfg.SetValue("graphics", "auto_exposure", AutoExposure);
@@ -475,8 +500,6 @@ public static class Settings
 
 		if (tree?.Root != null)
 		{
-			bool brightnessIsIdentity = Mathf.IsEqualApprox(Brightness, 1.0f);
-			Color brightnessTint = new(Brightness, Brightness, Brightness, 1f);
 			foreach (Node n in tree.Root.FindChildren("*", "SubViewport", true, false))
 			{
 				if (n is not SubViewport sv || !sv.OwnWorld3D) continue;
@@ -488,8 +511,6 @@ public static class Settings
 					? Viewport.ScreenSpaceAAEnum.Disabled
 					: Viewport.ScreenSpaceAAEnum.Smaa;
 				sv.AnisotropicFilteringLevel = (Viewport.AnisotropicFiltering)(int)Anisotropy;
-				if (!brightnessIsIdentity && sv.GetParent() is SubViewportContainer svc)
-					svc.Modulate = brightnessTint;
 			}
 		}
 
@@ -500,6 +521,7 @@ public static class Settings
 		ApplyShadows(Shadows, tree);
 		ApplyEnvironment(tree);
 		ApplyEffects(tree);
+		ViewmodelEnvSync.Sync(tree);
 	}
 
 	/// <summary>3D scaling mode from Upscaler + RenderScale; always Bilinear at native res.</summary>
@@ -521,8 +543,8 @@ public static class Settings
 	private static (int size, int depth) ResolveVolumetricFogSize() => VolumetricFog switch
 	{
 		VolumetricFogQuality.Low => (64, 64),
-		VolumetricFogQuality.Medium => (96, 96),
-		VolumetricFogQuality.High => (160, 160),
+		VolumetricFogQuality.Medium => (112, 112),
+		VolumetricFogQuality.High => (192, 192),
 		_ => (64, 64),
 	};
 
@@ -628,10 +650,12 @@ public static class Settings
 		env.SsaoEnabled = AmbientOcclusion;
 		env.SsrEnabled = Reflections;
 		env.SsilEnabled = Reflections;
+		env.GlowEnabled = Bloom;
 		env.VolumetricFogEnabled = VolumetricFog != VolumetricFogQuality.Off;
-		const float kSceneDefaultBrightness = 1.25f;
+		if (!env.HasMeta("authored_brightness"))
+			env.SetMeta("authored_brightness", env.AdjustmentBrightness);
 		env.AdjustmentEnabled = true;
-		env.AdjustmentBrightness = kSceneDefaultBrightness * Brightness;
+		env.AdjustmentBrightness = env.GetMeta("authored_brightness").AsSingle() * Brightness;
 	}
 
 	private static Sky _cachedSkyResource;
@@ -639,7 +663,7 @@ public static class Settings
 	private static Godot.Environment.AmbientSource _cachedAmbientSource = Godot.Environment.AmbientSource.Bg;
 	private static bool _skyCached;
 
-	/// <summary>Toggles map VFX nodes (cloud shadows, god rays, lens flare, dust motes), the post-FX compositor,
+	/// <summary>Toggles map VFX (cloud shadows, god rays), the post-FX compositor effects (lens flare, dust motes),
 	/// and the sky (background mode + sky resource clear/restore) per their settings.</summary>
 	private static void ApplyEffects(SceneTree tree)
 	{
@@ -683,10 +707,6 @@ public static class Settings
 			}
 			dl.LightProjector = CloudShadows ? dl.GetMeta("cloud_projector").As<Texture2D>() : null;
 		}
-		if (mapRoot.GetNodeOrNull("GodRays") is Node3D gr) gr.Visible = GodRays;
-		if (mapRoot.GetNodeOrNull("LensFlare") is Node3D lf) lf.Visible = LensFlare;
-		if (mapRoot.GetNodeOrNull("DustMotes") is Node3D dm) dm.Visible = DustMotes;
-
 		if (tree?.Root != null)
 		{
 			foreach (Node n in tree.Root.FindChildren("*", "ReflectionProbe", true, false))
@@ -704,6 +724,7 @@ public static class Settings
 		bool ppeFound = false;
 		bool ppeEnabled = false;
 		if (we?.Compositor is Compositor comp)
+		{
 			foreach (CompositorEffect effect in comp.CompositorEffects)
 			{
 				if (effect == null) continue;
@@ -717,8 +738,16 @@ public static class Settings
 					ppe.Vignette = Vignette;
 					ppe.Sharpening = false;
 					ppe.ChromaticAberration = ChromaticAberration;
+					ppe.EyeAdaptation = EyeAdaptation;
+					ppe.Purkinje = Purkinje;
+					ppe.CinematicBands = CinematicBands;
 				}
+				else if (effect is ScreenSpaceLensFlareEffect lfe)
+					lfe.Enabled = LensFlare;
+				else if (effect is DustMotesEffect dust)
+					dust.Enabled = DustMotes;
 			}
+		}
 		if (PostCanvasFx.Instance != null)
 		{
 			PostCanvasFx.Instance.Visible = useFullCanvas || canvasSharpen;

@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 using System.Collections.Generic;
 
@@ -12,15 +29,6 @@ namespace Vantix.Character;
 [GlobalClass]
 public partial class PuppetPlayer : NetworkPlayer
 {
-	/// <summary>Display name from the PlayerJoined event. Logging only.</summary>
-	public string PlayerName = "";
-
-	/// <summary>Spectate mode; the setter activates the matching camera.</summary>
-	public SpectateMode SpectateMode
-	{
-		get => _spectateMode;
-		set { _spectateMode = value; ApplySpectateMode(); }
-	}
 	private SpectateMode _spectateMode = SpectateMode.None;
 
 	private const int Capacity = 32;
@@ -48,15 +56,11 @@ public partial class PuppetPlayer : NetworkPlayer
 	private float _lastBracketedYaw;
 	private float _lastBracketedPitch;
 	private bool _lastBracketedAnglesValid;
-	/// <summary>The puppet is its own visual (it is the NetworkPlayer).</summary>
-	public NetworkPlayer GetVisual() => this;
-
 	private float _puppetBodyYaw;
 	private bool _bodyYawInitialized;
 	private const float MaxTwistRad = 1.5708f;
 	private const float BodyYawRateMoving = 12f;
 	private const float BodyYawRateStanding = 6f;
-
 
 	private enum PuppetLodTier { Near, Mid, Far, Off }
 	private const float LodNearMaxDist = 15f;
@@ -97,44 +101,46 @@ public partial class PuppetPlayer : NetworkPlayer
 
 	private const uint GlowTextVisualLayer = 1u << 19;
 
-	/// <summary>Sets up the visual child, animation throttling, and puppet flags.</summary>
-	public override void _Ready()
+	/// <summary>5 base colours indexed by TeamSlot. Deterministic, no net sync.</summary>
+	private static readonly Color[] PlayerPalette = new[]
 	{
-		base._Ready();   // SetupSim, anim tree, hitbox rig, OnSimReady (client collision layer)
-		if (Engine.IsEditorHint()) return;
-		ViewMode = ViewMode.Tps;
-		Visible = false;
-		_visualHiddenSinceUsec = Time.GetTicksUsec();
-		ApplySpectateMode();
+		new Color(0.30f, 0.60f, 1.00f), // blue
+		new Color(0.40f, 0.95f, 0.35f), // green
+		new Color(1.00f, 0.30f, 0.30f), // red
+		new Color(0.70f, 0.40f, 1.00f), // purple
+		new Color(1.00f, 0.95f, 0.30f), // yellow
+	};
 
-		if (TpsAnimTree != null)
-			TpsAnimTree.CallbackModeProcess = AnimationMixer.AnimationCallbackModeProcess.Manual;
+	private bool _glowCurrentlyOn;
 
-		_debugCapsuleMesh = new CapsuleMesh
-		{
-			Radius = CapsuleRadius,
-			Height = StandHeight,
-			RadialSegments = 8,
-			Rings = 4,
-		};
-		_serverPosDebugCapsule = new MeshInstance3D
-		{
-			Name = "sv_pos_debug_capsule",
-			Mesh = _debugCapsuleMesh,
-			MaterialOverride = new StandardMaterial3D
-			{
-				AlbedoColor = new Color(1f, 0.15f, 0.15f, 0.30f),
-				ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
-				Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
-				CullMode = BaseMaterial3D.CullModeEnum.Disabled,
-			},
-			CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
-			TopLevel = true,
-			Visible = false,
-		};
-		AddChild(_serverPosDebugCapsule);
+	/// <summary>Snapshot-gap threshold (µs) past which the puppet counts as re-entering the PVS (300ms).</summary>
+	private const ulong ResumeGapUsec = 300_000;
 
-		CallDeferred(MethodName.BuildGlowVisualsDeferred);
+	/// <summary>Multiplier on the MAD jitter signal for the safety buffer; 2.5×MAD ≈ 2σ (~95% coverage).</summary>
+	private const float JitterToBufferMultiplier = 2.5f;
+	/// <summary>Smoothing rate (1/sec) for _smoothedInterpDelay (~1s constant, frame-rate independent).</summary>
+	private const float SmoothingRate = 1.0f;
+
+	private bool _lastAimModifierActive;
+	private bool _lastAimModifierActiveValid;
+
+	private Camera3D _spectateTpsCam;
+	private Vector3 _spectateTpsRestLocal;
+	private bool _spectateTpsRestCached;
+	private PhysicsRayQueryParameters3D _spectateRayQuery;
+	private readonly PhysicsRayQueryResult3D _spectateRayResult = new();
+	private const float SpectateWallMargin = 0.15f;
+	private const float SpectateSmoothRate = 12f;
+	private const uint SpectateCollisionMask = 1u;
+
+	/// <summary>Display name from the PlayerJoined event. Logging only.</summary>
+	public string PlayerName = "";
+
+	/// <summary>Spectate mode; the setter activates the matching camera.</summary>
+	public SpectateMode SpectateMode
+	{
+		get => _spectateMode;
+		set { _spectateMode = value; ApplySpectateMode(); }
 	}
 
 	/// <summary>Finds the baked silhouette, resets delta trackers, and attaches the Label3D nameplate.
@@ -189,19 +195,6 @@ public partial class PuppetPlayer : NetworkPlayer
 		return null;
 	}
 
-	/// <summary>5 base colours indexed by TeamSlot. Deterministic, no net sync.</summary>
-	private static readonly Color[] PlayerPalette = new[]
-	{
-		new Color(0.30f, 0.60f, 1.00f), // blue
-		new Color(0.40f, 0.95f, 0.35f), // green
-		new Color(1.00f, 0.30f, 0.30f), // red
-		new Color(0.70f, 0.40f, 1.00f), // purple
-		new Color(1.00f, 0.95f, 0.30f), // yellow
-	};
-
-	/// <summary>Per-player colour from NetId, same on every client. Used for glow, label and scoreboard.</summary>
-	public static Color PlayerColor(byte netId) => PlayerPalette[netId % PlayerPalette.Length];
-
 	/// <summary>Pushes HP/Team/TeamSlot into the nameplate and body-ID material. Glow + label only for teammates
 	/// (or everyone when spectating) and never in Deathmatch. Fields delta-checked to avoid per-frame churn.</summary>
 	private void UpdateNameAndGlow(SnapshotPlayer snap)
@@ -238,8 +231,6 @@ public partial class PuppetPlayer : NetworkPlayer
 		}
 	}
 
-	private bool _glowCurrentlyOn;
-
 	/// <summary>Toggles silhouette + Label3D Visible — the whole on/off mechanism, since the material chain is
 	/// baked. Gated by Settings.TeamGlow; spectator visibility is decided in UpdateNameAndGlow.</summary>
 	private void ApplyTeamGlow(bool enabled)
@@ -265,30 +256,6 @@ public partial class PuppetPlayer : NetworkPlayer
 		if (!Mathf.IsEqualApprox(_debugCapsuleMesh.Height, h)) _debugCapsuleMesh.Height = h;
 		_serverPosDebugCapsule.GlobalPosition = latestSnap.Pos + new Vector3(0f, h * 0.5f, 0f);
 	}
-
-	/// <summary>Pushes a snapshot into the interp buffer and records arrival wallclock; out-of-order packets
-	/// dropped. If the gap since the last snapshot exceeds ResumeGapUsec, wipes the buffer and snaps position
-	/// (FoW resume), avoiding a slide-through-walls lerp on PVS re-entry.</summary>
-	public void PushSnapshot(uint serverTick, SnapshotPlayer snap)
-	{
-		if (_buf.Count > 0 && serverTick <= _buf[_buf.Count - 1].Tick) return;
-		ulong now = Time.GetTicksUsec();
-		if (_lastSnapshotPushUsec > 0 && (now - _lastSnapshotPushUsec) > ResumeGapUsec)
-			ResetOnVisibilityResume(snap);
-		_buf.Add(new Entry { Tick = serverTick, Snap = snap });
-		while (_buf.Count > Capacity) _buf.RemoveAt(0);
-		_lastSnapshotPushUsec = now;
-
-		if (!Visible
-			&& (snap.Flags & (byte)SnapshotFlags.WorldReady) != 0)
-		{
-			Visible = true;
-			Dbg.Print($"[PuppetPlayer netId={NetId}] world-ready → TPS body revealed");
-		}
-	}
-
-	/// <summary>Snapshot-gap threshold (µs) past which the puppet counts as re-entering the PVS (300ms).</summary>
-	private const ulong ResumeGapUsec = 300_000;
 
 	/// <summary>After a long visibility gap: clears the buffer so the next tick brackets only fresh data,
 	/// snaps position, and reseeds the smoothed interp delay.</summary>
@@ -324,10 +291,223 @@ public partial class PuppetPlayer : NetworkPlayer
 		return effective;
 	}
 
-	/// <summary>Multiplier on the MAD jitter signal for the safety buffer; 2.5×MAD ≈ 2σ (~95% coverage).</summary>
-	private const float JitterToBufferMultiplier = 2.5f;
-	/// <summary>Smoothing rate (1/sec) for _smoothedInterpDelay (~1s constant, frame-rate independent).</summary>
-	private const float SmoothingRate = 1.0f;
+	/// <summary>Manual frustum test against the cached camera basis: one cone-angle test of the puppet midpoint
+	/// vs camForward with a radius/distance-scaled pad (replaces a 7-point IsPositionInFrustum sweep).</summary>
+	private bool SilhouetteInFrustumManual(Camera3D cam, Vector3 camPos, Vector3 camForward, float cosFovHalf)
+	{
+		if (cam == null) return true;
+		Vector3 center = GlobalPosition + new Vector3(0f, StandHeight * 0.5f, 0f);
+		Vector3 toPuppet = center - camPos;
+		float dist = toPuppet.Length();
+		if (dist < 0.0001f) return true;
+		float forwardDist = camForward.Dot(toPuppet);
+		if (forwardDist < -StandHeight) return false;
+		float angularPadCos;
+		if (forwardDist <= 0.1f)
+		{
+			angularPadCos = 1f;
+		}
+		else
+		{
+			float capR = Mathf.Max(CapsuleRadius, StandHeight * 0.5f);
+			float angularExtentRad = Mathf.Atan2(capR, forwardDist);
+			angularPadCos = Mathf.Cos(Mathf.Acos(Mathf.Clamp(cosFovHalf, -1f, 1f)) + angularExtentRad);
+		}
+		float dirDot = forwardDist / dist;
+		return dirDot >= angularPadCos;
+	}
+
+	/// <summary>Activates the camera matching the current <see cref="SpectateMode"/>.</summary>
+	private void ApplySpectateMode()
+	{
+		var fpsCam = GetNodeOrNull<Camera3D>("head_pitch/fps_camera");
+		var tpsCam = GetNodeOrNull<Camera3D>("head_pitch/tps_camera");
+		bool wantTps = _spectateMode == SpectateMode.Tps;
+		bool wantFps = _spectateMode == SpectateMode.Fps;
+		if (fpsCam != null) fpsCam.Current = wantFps;
+		if (tpsCam != null) tpsCam.Current = wantTps;
+		if (wantTps) EnsureSpectateTpsCacheReady();
+	}
+
+	/// <summary>LOD tier → animation update rate (Hz); Off returns 0 to skip the advance.</summary>
+	[System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+	private static float LodTierUpdateHz(PuppetLodTier tier) => tier switch
+	{
+		PuppetLodTier.Near => 60f,
+		PuppetLodTier.Mid => 30f,
+		PuppetLodTier.Far => 12f,
+		_ => 0f,
+	};
+
+	/// <summary>Picks the LOD tier from camera distance plus a forgiving frustum check. Camera + basis come
+	/// from the caller to avoid a second GetCamera3D() per frame.</summary>
+	[System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
+	private PuppetLodTier ResolveLodTierCached(Camera3D cam, Vector3 camPos, Vector3 camForward, float cosFovHalf)
+	{
+		if (cam == null) return PuppetLodTier.Near;
+		Vector3 toPuppet = GlobalPosition - camPos;
+		float dist = toPuppet.Length();
+		bool inFrustum = true;
+		if (dist > LodNearMaxDist)
+		{
+			float dirDot = camForward.Dot(toPuppet / Mathf.Max(dist, 0.0001f));
+			inFrustum = dirDot >= (cosFovHalf - LodFrustumPadCos);
+		}
+		if (!inFrustum) return dist <= LodMidMaxDist ? PuppetLodTier.Far : PuppetLodTier.Off;
+		if (dist <= LodNearMaxDist) return PuppetLodTier.Near;
+		if (dist <= LodMidMaxDist) return PuppetLodTier.Mid;
+		if (dist <= LodFarMaxDist) return PuppetLodTier.Far;
+		return PuppetLodTier.Off;
+	}
+
+	/// <summary>Disables the spine-aim modifier in the Off tier (skips its per-frame quaternion math). Lookup
+	/// cached; the Active setter is delta-gated.</summary>
+	private void ApplyAimModifierLod()
+	{
+		if (!_aimModifierLookupDone)
+		{
+			_aimModifierLookupDone = true;
+				_cachedAimModifier = AimModifier;
+		}
+		if (_cachedAimModifier == null) return;
+		bool wantActive = _lodTier != PuppetLodTier.Off;
+		if (!_lastAimModifierActiveValid || _lastAimModifierActive != wantActive)
+		{
+			_cachedAimModifier.Active = wantActive;
+			_lastAimModifierActive = wantActive;
+			_lastAimModifierActiveValid = true;
+		}
+	}
+
+	/// <summary>Caches the spectator third-person camera reference and its rest position on first activation.</summary>
+	private void EnsureSpectateTpsCacheReady()
+	{
+		if (_spectateTpsRestCached) return;
+		_spectateTpsCam = GetNodeOrNull<Camera3D>("head_pitch/tps_camera");
+		if (_spectateTpsCam != null)
+		{
+			_spectateTpsRestLocal = _spectateTpsCam.Position;
+			_spectateTpsRestCached = true;
+			_spectateRayQuery = new PhysicsRayQueryParameters3D { CollisionMask = SpectateCollisionMask, Exclude = new Godot.Collections.Array<Rid> { GetRid() } };
+		}
+	}
+
+	/// <summary>Spring-arm step for the spectator TPS camera: raycasts pivot→rest, pulls in on a hit, lerps.</summary>
+	private void UpdateSpectateTpsCollision(float dt)
+	{
+		if (!_spectateTpsRestCached) EnsureSpectateTpsCacheReady();
+		if (!_spectateTpsRestCached) return;
+		var head = HeadPitch;
+		if (head == null || _spectateTpsCam == null) return;
+
+		var space = GetWorld3D()?.DirectSpaceState;
+		if (space == null) return;
+
+		Vector3 worldDesired = head.GlobalTransform * _spectateTpsRestLocal;
+		Vector3 pivot = head.GlobalPosition;
+		_spectateRayQuery.From = pivot;
+		_spectateRayQuery.To = worldDesired;
+
+		Vector3 targetLocal;
+		if (space.IntersectRayInto(_spectateRayQuery, _spectateRayResult))
+		{
+			Vector3 hitPos = _spectateRayResult.GetPosition();
+			Vector3 dir = worldDesired - pivot;
+			float desiredDist = dir.Length();
+			if (desiredDist > 0.001f)
+			{
+				float hitDist = (hitPos - pivot).Length();
+				float safeDist = Mathf.Max(0.1f, hitDist - SpectateWallMargin);
+				Vector3 safeWorld = pivot + dir / desiredDist * safeDist;
+				targetLocal = head.GlobalTransform.AffineInverse() * safeWorld;
+			}
+			else targetLocal = _spectateTpsRestLocal;
+		}
+		else targetLocal = _spectateTpsRestLocal;
+
+		float lerpT = 1f - Mathf.Exp(-SpectateSmoothRate * dt);
+		_spectateTpsCam.Position = _spectateTpsCam.Position.Lerp(targetLocal, lerpT);
+	}
+
+	/// <summary>Down-raycast under the puppet so jump/land sounds use the same material and tunnel-reverb
+	/// state as the local player.</summary>
+	private (StringName material, bool inTunnel) ProbeGround()
+	{
+		var space = GetWorld3D()?.DirectSpaceState;
+		if (space == null) return ((StringName)"default", false);
+		Vector3 from = GlobalPosition + Vector3.Up * 0.4f;
+		HitInfo hit = Hitscan.Cast(space, from, Vector3.Down, 1.0f, exclude: GetRid(), mask: HitscanMask);
+		var mat = hit.Hit ? hit.Material : (StringName)"default";
+		bool inTunnel = hit.Hit && hit.Collider != null && hit.Collider.IsInGroup("tunnel");
+		return (mat, inTunnel);
+	}
+
+	/// <summary>The puppet is its own visual (it is the NetworkPlayer).</summary>
+	public NetworkPlayer GetVisual() => this;
+
+	/// <summary>Sets up the visual child, animation throttling, and puppet flags.</summary>
+	public override void _Ready()
+	{
+		base._Ready();   // SetupSim, anim tree, hitbox rig, OnSimReady (client collision layer)
+		if (Engine.IsEditorHint()) return;
+		ViewMode = ViewMode.Tps;
+		Visible = false;
+		_visualHiddenSinceUsec = Time.GetTicksUsec();
+		ApplySpectateMode();
+
+		if (TpsAnimTree != null)
+			TpsAnimTree.CallbackModeProcess = AnimationMixer.AnimationCallbackModeProcess.Manual;
+
+		_debugCapsuleMesh = new CapsuleMesh
+		{
+			Radius = CapsuleRadius,
+			Height = StandHeight,
+			RadialSegments = 8,
+			Rings = 4,
+		};
+		_serverPosDebugCapsule = new MeshInstance3D
+		{
+			Name = "sv_pos_debug_capsule",
+			Mesh = _debugCapsuleMesh,
+			MaterialOverride = new StandardMaterial3D
+			{
+				AlbedoColor = new Color(1f, 0.15f, 0.15f, 0.30f),
+				ShadingMode = BaseMaterial3D.ShadingModeEnum.Unshaded,
+				Transparency = BaseMaterial3D.TransparencyEnum.Alpha,
+				CullMode = BaseMaterial3D.CullModeEnum.Disabled,
+			},
+			CastShadow = GeometryInstance3D.ShadowCastingSetting.Off,
+			TopLevel = true,
+			Visible = false,
+		};
+		AddChild(_serverPosDebugCapsule);
+
+		CallDeferred(MethodName.BuildGlowVisualsDeferred);
+	}
+
+	/// <summary>Per-player colour from NetId, same on every client. Used for glow, label and scoreboard.</summary>
+	public static Color PlayerColor(byte netId) => PlayerPalette[netId % PlayerPalette.Length];
+
+	/// <summary>Pushes a snapshot into the interp buffer and records arrival wallclock; out-of-order packets
+	/// dropped. If the gap since the last snapshot exceeds ResumeGapUsec, wipes the buffer and snaps position
+	/// (FoW resume), avoiding a slide-through-walls lerp on PVS re-entry.</summary>
+	public void PushSnapshot(uint serverTick, SnapshotPlayer snap)
+	{
+		if (_buf.Count > 0 && serverTick <= _buf[_buf.Count - 1].Tick) return;
+		ulong now = Time.GetTicksUsec();
+		if (_lastSnapshotPushUsec > 0 && (now - _lastSnapshotPushUsec) > ResumeGapUsec)
+			ResetOnVisibilityResume(snap);
+		_buf.Add(new Entry { Tick = serverTick, Snap = snap });
+		while (_buf.Count > Capacity) _buf.RemoveAt(0);
+		_lastSnapshotPushUsec = now;
+
+		if (!Visible
+			&& (snap.Flags & (byte)SnapshotFlags.WorldReady) != 0)
+		{
+			Visible = true;
+			Dbg.Print($"[PuppetPlayer netId={NetId}] world-ready → TPS body revealed");
+		}
+	}
 
 	/// <summary>Per-frame interp: computes the renderTick, brackets the surrounding snapshots, blends them and
 	/// pushes the result into the movement controller and anim tree. Past the newest snapshot, position
@@ -534,156 +714,6 @@ public partial class PuppetPlayer : NetworkPlayer
 			UpdateNameAndGlow(_buf[_buf.Count - 1].Snap);
 	}
 
-	/// <summary>Manual frustum test against the cached camera basis: one cone-angle test of the puppet midpoint
-	/// vs camForward with a radius/distance-scaled pad (replaces a 7-point IsPositionInFrustum sweep).</summary>
-	private bool SilhouetteInFrustumManual(Camera3D cam, Vector3 camPos, Vector3 camForward, float cosFovHalf)
-	{
-		if (cam == null) return true;
-		Vector3 center = GlobalPosition + new Vector3(0f, StandHeight * 0.5f, 0f);
-		Vector3 toPuppet = center - camPos;
-		float dist = toPuppet.Length();
-		if (dist < 0.0001f) return true;
-		float forwardDist = camForward.Dot(toPuppet);
-		if (forwardDist < -StandHeight) return false;
-		float angularPadCos;
-		if (forwardDist <= 0.1f)
-		{
-			angularPadCos = 1f;
-		}
-		else
-		{
-			float capR = Mathf.Max(CapsuleRadius, StandHeight * 0.5f);
-			float angularExtentRad = Mathf.Atan2(capR, forwardDist);
-			angularPadCos = Mathf.Cos(Mathf.Acos(Mathf.Clamp(cosFovHalf, -1f, 1f)) + angularExtentRad);
-		}
-		float dirDot = forwardDist / dist;
-		return dirDot >= angularPadCos;
-	}
-
-	/// <summary>Activates the camera matching the current <see cref="SpectateMode"/>.</summary>
-	private void ApplySpectateMode()
-	{
-		var fpsCam = GetNodeOrNull<Camera3D>("head_pitch/fps_camera");
-		var tpsCam = GetNodeOrNull<Camera3D>("head_pitch/tps_camera");
-		bool wantTps = _spectateMode == SpectateMode.Tps;
-		bool wantFps = _spectateMode == SpectateMode.Fps;
-		if (fpsCam != null) fpsCam.Current = wantFps;
-		if (tpsCam != null) tpsCam.Current = wantTps;
-		if (wantTps) EnsureSpectateTpsCacheReady();
-	}
-
-	/// <summary>LOD tier → animation update rate (Hz); Off returns 0 to skip the advance.</summary>
-	[System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-	private static float LodTierUpdateHz(PuppetLodTier tier) => tier switch
-	{
-		PuppetLodTier.Near => 60f,
-		PuppetLodTier.Mid => 30f,
-		PuppetLodTier.Far => 12f,
-		_ => 0f,
-	};
-
-	/// <summary>Picks the LOD tier from camera distance plus a forgiving frustum check. Camera + basis come
-	/// from the caller to avoid a second GetCamera3D() per frame.</summary>
-	[System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.AggressiveInlining)]
-	private PuppetLodTier ResolveLodTierCached(Camera3D cam, Vector3 camPos, Vector3 camForward, float cosFovHalf)
-	{
-		if (cam == null) return PuppetLodTier.Near;
-		Vector3 toPuppet = GlobalPosition - camPos;
-		float dist = toPuppet.Length();
-		bool inFrustum = true;
-		if (dist > LodNearMaxDist)
-		{
-			float dirDot = camForward.Dot(toPuppet / Mathf.Max(dist, 0.0001f));
-			inFrustum = dirDot >= (cosFovHalf - LodFrustumPadCos);
-		}
-		if (!inFrustum) return dist <= LodMidMaxDist ? PuppetLodTier.Far : PuppetLodTier.Off;
-		if (dist <= LodNearMaxDist) return PuppetLodTier.Near;
-		if (dist <= LodMidMaxDist) return PuppetLodTier.Mid;
-		if (dist <= LodFarMaxDist) return PuppetLodTier.Far;
-		return PuppetLodTier.Off;
-	}
-
-	private bool _lastAimModifierActive;
-	private bool _lastAimModifierActiveValid;
-
-	/// <summary>Disables the spine-aim modifier in the Off tier (skips its per-frame quaternion math). Lookup
-	/// cached; the Active setter is delta-gated.</summary>
-	private void ApplyAimModifierLod()
-	{
-		if (!_aimModifierLookupDone)
-		{
-			_aimModifierLookupDone = true;
-				_cachedAimModifier = AimModifier;
-		}
-		if (_cachedAimModifier == null) return;
-		bool wantActive = _lodTier != PuppetLodTier.Off;
-		if (!_lastAimModifierActiveValid || _lastAimModifierActive != wantActive)
-		{
-			_cachedAimModifier.Active = wantActive;
-			_lastAimModifierActive = wantActive;
-			_lastAimModifierActiveValid = true;
-		}
-	}
-
-	private Camera3D _spectateTpsCam;
-	private Vector3 _spectateTpsRestLocal;
-	private bool _spectateTpsRestCached;
-	private PhysicsRayQueryParameters3D _spectateRayQuery;
-	private readonly PhysicsRayQueryResult3D _spectateRayResult = new();
-	private const float SpectateWallMargin = 0.15f;
-	private const float SpectateSmoothRate = 12f;
-	private const uint SpectateCollisionMask = 1u;
-
-	/// <summary>Caches the spectator third-person camera reference and its rest position on first activation.</summary>
-	private void EnsureSpectateTpsCacheReady()
-	{
-		if (_spectateTpsRestCached) return;
-		_spectateTpsCam = GetNodeOrNull<Camera3D>("head_pitch/tps_camera");
-		if (_spectateTpsCam != null)
-		{
-			_spectateTpsRestLocal = _spectateTpsCam.Position;
-			_spectateTpsRestCached = true;
-			_spectateRayQuery = new PhysicsRayQueryParameters3D { CollisionMask = SpectateCollisionMask, Exclude = new Godot.Collections.Array<Rid> { GetRid() } };
-		}
-	}
-
-	/// <summary>Spring-arm step for the spectator TPS camera: raycasts pivot→rest, pulls in on a hit, lerps.</summary>
-	private void UpdateSpectateTpsCollision(float dt)
-	{
-		if (!_spectateTpsRestCached) EnsureSpectateTpsCacheReady();
-		if (!_spectateTpsRestCached) return;
-		var head = HeadPitch;
-		if (head == null || _spectateTpsCam == null) return;
-
-		var space = GetWorld3D()?.DirectSpaceState;
-		if (space == null) return;
-
-		Vector3 worldDesired = head.GlobalTransform * _spectateTpsRestLocal;
-		Vector3 pivot = head.GlobalPosition;
-		_spectateRayQuery.From = pivot;
-		_spectateRayQuery.To = worldDesired;
-
-		Vector3 targetLocal;
-		if (space.IntersectRayInto(_spectateRayQuery, _spectateRayResult))
-		{
-			Vector3 hitPos = _spectateRayResult.GetPosition();
-			Vector3 dir = worldDesired - pivot;
-			float desiredDist = dir.Length();
-			if (desiredDist > 0.001f)
-			{
-				float hitDist = (hitPos - pivot).Length();
-				float safeDist = Mathf.Max(0.1f, hitDist - SpectateWallMargin);
-				Vector3 safeWorld = pivot + dir / desiredDist * safeDist;
-				targetLocal = head.GlobalTransform.AffineInverse() * safeWorld;
-			}
-			else targetLocal = _spectateTpsRestLocal;
-		}
-		else targetLocal = _spectateTpsRestLocal;
-
-		float lerpT = 1f - Mathf.Exp(-SpectateSmoothRate * dt);
-		_spectateTpsCam.Position = _spectateTpsCam.Position.Lerp(targetLocal, lerpT);
-	}
-
 	/// <summary>Remote shot: spawns tracer + impact decal, plays shoot audio, triggers the TPS fire one-shot.</summary>
 	public void PlayShot(byte weaponId, Vector3 origin, Vector3 dir, bool tracer,
 		bool hit, Vector3 hitPos, Vector3 hitNormal, string material)
@@ -758,18 +788,5 @@ public partial class PuppetPlayer : NetworkPlayer
 	{
 		SmokeGrenade.Spawn(GetParent(), origin, velocity, GetRid(),
 			ownerNetId: ownerNetId, projectileId: projectileId, isPuppet: true);
-	}
-
-	/// <summary>Down-raycast under the puppet so jump/land sounds use the same material and tunnel-reverb
-	/// state as the local player.</summary>
-	private (StringName material, bool inTunnel) ProbeGround()
-	{
-		var space = GetWorld3D()?.DirectSpaceState;
-		if (space == null) return ((StringName)"default", false);
-		Vector3 from = GlobalPosition + Vector3.Up * 0.4f;
-		HitInfo hit = Hitscan.Cast(space, from, Vector3.Down, 1.0f, exclude: GetRid(), mask: HitscanMask);
-		var mat = hit.Hit ? hit.Material : (StringName)"default";
-		bool inTunnel = hit.Hit && hit.Collider != null && hit.Collider.IsInGroup("tunnel");
-		return (mat, inTunnel);
 	}
 }

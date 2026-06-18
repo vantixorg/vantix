@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 
 namespace Vantix.Character;
@@ -5,12 +22,12 @@ namespace Vantix.Character;
 /// <summary>
 /// Per-tick bone pose history per player (hitbox GlobalTransforms). Lets lag-comp rewind animated
 /// bone positions, so headshots land when server/client animation differ by a frame or two.
-/// Buffers 32 ticks (~250ms at 128Hz).
+/// Buffers 128 ticks (~1s at 128Hz).
 /// </summary>
 public class BonePoseRewindBuffer
 {
 	private struct Entry { public uint Tick; public Transform3D[] Transforms; }
-	private const int BufferSize = 32;
+	public const int BufferSize = 128;
 	private readonly Entry[] _ring = new Entry[BufferSize];
 	private int _writeIdx;
 	private int _count;

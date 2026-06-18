@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 using System.Collections.Generic;
 
@@ -7,9 +24,6 @@ namespace Vantix.Weapon;
 [Tool, GlobalClass]
 public partial class WeaponAnimation : Node3D
 {
-	[ExportGroup("Weapon Settings")]
-	[Export] public StringName WeaponName;
-	[Export] public WeaponMode Mode = WeaponMode.FPS;
 	private static readonly HashSet<string> AnimProps = new()
 	{
 		nameof(ReferencePose), nameof(FireModeStates),
@@ -35,6 +49,55 @@ public partial class WeaponAnimation : Node3D
 		nameof(EvClearJamMagSwipe), nameof(EvClearJamRack),
 	};
 
+	private int _tracerShotCount;
+	private const string TreeNodeName = "AnimationTree";
+	private static readonly StringName _pActionRequest = "parameters/Action/request";
+	private AnimationTree _tree;
+	private AnimationPlayer _player;
+	private AnimationPlayer _eventPlayer;
+	private AnimationNodeAnimation _actionAnim;
+	private Skeleton3D _skeleton;
+	private int _fireSelectorBone = -1;
+	private int _ejectionBone = -1;
+	private FireSelectorModifier _fireSelectorModifier;
+	private Node3D _mainMag;
+	private Node3D _reserveMag;
+	private Bullet[] _bulletPool;
+	private int _bulletPoolIdx;
+	private AudioStreamPlayer3D _audioPlayer;
+	private AudioStreamPlayer3D[] _audioPool;
+	private int _audioVoiceIdx;
+	private AnimatedMagazin _mainMagAnim;
+	private AnimatedMagazin _reserveMagAnim;
+
+	private bool _weaponActive;
+
+	private Animation _fireSelectorAnim;
+	private int[] _fireSelectorTracks = [];
+	private float _fireSelectorTime;
+
+	private bool IsTPS => Mode == WeaponMode.TPS;
+	private GpuParticles3D _muzzleSmoke;
+	private Material _smokeMaterial;
+	private Transform3D _pendingSmokeMuzzle;
+	private int _smokeBurstGen;
+	private const float SmokeTrailDelay = 0.13f;
+	private const string DefaultSmokeMaterialPath = "res://fx/muzzle_smoke/smoke.tres";
+
+	private GpuParticles3D _muzzleFlash;
+	private OmniLight3D _muzzleLight;
+	private const string MuzzleFlameTexture = "res://assets/weapons/ar15/textures/T_TFA_MuzzleFlash_Flame_E.EXR";
+	private const float MuzzleFlashSize = 0.52f;
+	private const float MuzzleFlashEnergy = 0.75f;
+	private const float MuzzleFlashSaturation = 0.45f;
+	private const float MuzzleFlashLightEnergy = 1.5f;
+	private const int MuzzleFlashHFrames = 8;
+	private const int MuzzleFlashVFrames = 8;
+	private static readonly Color MuzzleFlashColor = new(1f, 0.72f, 0.35f);
+
+	[ExportGroup("Weapon Settings")]
+	[Export] public StringName WeaponName;
+	[Export] public WeaponMode Mode = WeaponMode.FPS;
 	[ExportGroup("Animation Player")]
 	[Export] public NodePath AnimationPlayerPath = new("MergedAnimationPlayer");
 	[Export] public NodePath EventPlayerPath = new("EventPlayer");
@@ -128,13 +191,12 @@ public partial class WeaponAnimation : Node3D
 	[Export] public float EjectMaxForce = 3.5f;
 	[Export] public float EjectRotationSpeed = 20f;
 	[Export] public float EjectLifetime = 15f;
-	// Eject-bone-local fling direction before random spread (flip X for left-ejecting weapons).
 	[Export] public Vector3 EjectDirectionLocal = new(1f, 0.4f, 0.15f);
 
 	[ExportGroup("Drop Magazine")]
 	[Export] public PackedScene DropMagazineScene;
-	[Export] public float DropImpulseForce = 1.5f;       // m/s along the mag socket up axis (UE: ImpulseForce, VelChange)
-	[Export] public float DropRotationForce = 360f;      // deg/s about a random axis (UE: RotationForce, VelChange)
+	[Export] public float DropImpulseForce = 1.5f;
+	[Export] public float DropRotationForce = 360f;
 	[Export] public float DropMagazineLifetime = 8f;
 
 	[ExportGroup("Magazine")]
@@ -176,7 +238,6 @@ public partial class WeaponAnimation : Node3D
 	[Export] public AudioStream[] AudioMagRemoveEmpty = [];
 	[Export(PropertyHint.Range, "0,1,0.01")] public float VolumeMagRemoveEmpty = 1.0f;
 
-	// Per-weapon recoil + view-kick feel, read by NetworkPlayer. Damped spring: kick displaces, spring recovers.
 	[ExportGroup("Recoil & View Kick")]
 	[Export] public Vector3 RecoilImpulseHipfire = new(-0.8f, 0.28f, 0f);
 	[Export] public Vector3 RecoilImpulseAimed = new(-0.15f, 0.05f, 0f);
@@ -184,16 +245,13 @@ public partial class WeaponAnimation : Node3D
 	[Export(PropertyHint.Range, "0.1,1.5,0.05")] public float RecoilDamping = 0.6f;
 	[Export(PropertyHint.Range, "0.2,4,0.1")] public float RecoilMass = 1f;
 	[Export(PropertyHint.Range, "1,45,0.5")] public float RecoilMaxDegrees = 10f;
-	// View-kick scale while aiming (lerped by aim blend).
 	[Export(PropertyHint.Range, "0,1,0.05")] public float AimRecoilMultiplier = 0.5f;
-	// Weapon-bone recoil on top of camera kick: rotation scales the spring (deg), kickback pushes toward the player (m/deg).
 	[Export(PropertyHint.Range, "0,1,0.02")] public float WeaponRecoilRotScale = 0.15f;
 	[Export(PropertyHint.Range, "0,0.05,0.001")] public float WeaponRecoilKickback = 0.005f;
 
-	// Per-weapon ADS calibration: iron-sight offset (WeaponBoneModifier), FOV zoom, crouch/canted offsets. Character composes these with its blend state.
 	[ExportGroup("ADS (Viewmodel)")]
 	[Export(PropertyHint.Range, "30,120,0.5")] public float AimFov = 78f;
-	[Export(PropertyHint.Range, "20,90,1")] public float TpsAimFov = 50f;   // third-person / spectator ADS zoom
+	[Export(PropertyHint.Range, "20,90,1")] public float TpsAimFov = 50f;
 	[Export(PropertyHint.Range, "1,30,0.1")] public float AimBlendSpeed = 12f;
 	[Export(PropertyHint.Range, "-1,1,0.0001,or_less,or_greater")] public Vector3 AdsOffsetPosition = new(-0.02f, 0.06f, 0.0205f);
 	[Export(PropertyHint.Range, "-180,180,0.01,or_less,or_greater")] public Vector3 AdsOffsetRotation = new(0f, -8.4f, 0f);
@@ -202,7 +260,6 @@ public partial class WeaponAnimation : Node3D
 	[Export(PropertyHint.Range, "-1,1,0.0001,or_less,or_greater")] public Vector3 CantedOffsetPosition = new(-0.05f, -0.015f, -0.01f);
 	[Export(PropertyHint.Range, "-180,180,0.01,or_less,or_greater")] public Vector3 CantedOffsetRotation = new(0f, 35.0f, 0f);
 
-	// Editor-only ADS preview: each *TestMode forces its blend so the matching offset can be tuned. No runtime effect.
 	[ExportSubgroup("Test (Editor)")]
 	[Export] public bool AdsTestMode = false;
 	[Export] public bool CrouchTestMode = false;
@@ -219,86 +276,23 @@ public partial class WeaponAnimation : Node3D
 	[Export] public Color TracerColor = new(2.5f, 1.6f, 0.5f, 1f);
 	[Export(PropertyHint.Range, "20,300,5")] public float TracerSpeed = 80f;
 	[Export(PropertyHint.Range, "0.2,5,0.1")] public float TracerStreakLength = 2f;
-	private int _tracerShotCount;
-	/// <summary>True on every Nth fired round; advances the shot counter, so call exactly once per fired round.</summary>
-	public bool ShouldSpawnTracer() => TracerEnabled && _tracerShotCount++ % Mathf.Max(1, TracerEveryNShots) == 0;
+	[ExportGroup("Muzzle Smoke")]
+	[Export] public Material MuzzleSmokeMaterial;
+	[Export] public Vector2 MuzzleSmokeSize = new(0.6f, 0.6f);
+	[Export(PropertyHint.Range, "0,90,1")] public float MuzzleSmokeSpread = 28f;
+	[Export(PropertyHint.Range, "0,5,0.05")] public float MuzzleSmokeSpeed = 1.5f;
+	[Export(PropertyHint.Range, "0,1,0.005")] public float MuzzleSmokeDensity = 0.065f;
+	[Export(PropertyHint.Range, "0,2,0.01")] public float MuzzleSmokeLightTransmittance = 0.45f;
 
 	[ExportGroup("Debug")]
 	[Export] public bool LogEvents = true;
 
-	public override void _ValidateProperty(Godot.Collections.Dictionary property)
-	{
-		string name = (string)property["name"];
-		if (AnimProps.Contains(name))
-		{
-			var player = GetNodeOrNull<AnimationPlayer>(AnimationPlayerPath);
-			if (player == null)
-				return;
-			property["hint"] = (int)PropertyHint.Enum;
-			property["hint_string"] = string.Join(",", player.GetAnimationList());
-		}
-		else if (EventProps.Contains(name))
-		{
-			var ep = GetNodeOrNull<AnimationPlayer>(EventPlayerPath);
-			if (ep == null)
-				return;
-			property["hint"] = (int)PropertyHint.Enum;
-			property["hint_string"] = string.Join(",", ep.GetAnimationList());
-		}
-		else if (name == nameof(AudioBus))
-		{
-			var buses = new string[AudioServer.BusCount];
-			for (int i = 0; i < buses.Length; i++)
-				buses[i] = AudioServer.GetBusName(i);
-			property["hint"] = (int)PropertyHint.Enum;
-			property["hint_string"] = string.Join(",", buses);
-		}
-	}
-
-	// Player body that ejected casings/dropped mags must not collide with. Set by NetworkPlayer, else auto-resolved.
 	public CollisionObject3D OwnerBody;
 
-	// FPS viewmodel: reprojects prop spawn transforms from the SubViewport world into the main world
-	// (worldCam * viewmodelCam^-1 * local). Null on TPS weapons (already in the main world).
 	public Camera3D RemapFromCamera;
 	public Camera3D RemapToCamera;
 
-	private const string TreeNodeName = "AnimationTree";
-	private static readonly StringName _pActionRequest = "parameters/Action/request";
-	private AnimationTree _tree;
-	private AnimationPlayer _player;
-	private AnimationPlayer _eventPlayer;
-	private AnimationNodeAnimation _actionAnim;
-	private Skeleton3D _skeleton;
-	private int _fireSelectorBone = -1;
-	private int _ejectionBone = -1;
-	private FireSelectorModifier _fireSelectorModifier;
-	private Node3D _mainMag;
-	private Node3D _reserveMag;
-	private Bullet[] _bulletPool;
-	private int _bulletPoolIdx;
-	private AudioStreamPlayer3D _audioPlayer;
-	private AudioStreamPlayer3D[] _audioPool;
-	private int _audioVoiceIdx;
-	private AnimatedMagazin _mainMagAnim;
-	private AnimatedMagazin _reserveMagAnim;
-
-	public override void _Ready()
-	{
-		if (Engine.IsEditorHint())
-			return;
-		BuildAnimationTree();
-		BuildMuzzleSmoke();
-		BuildMuzzleFlash();
-	}
-
-	private bool _weaponActive;
-
-	/// <summary>Switches the tree callback to Idle. Inactive instances stay Manual (frozen, zero cost).</summary>
-	public void ActivateWeapon() { _weaponActive = true; ApplyWeaponActive(); }
-
-	/// <summary>Freezes animation (tree back to Manual).</summary>
-	public void DeactivateWeapon() { _weaponActive = false; ApplyWeaponActive(); }
+	public bool Aiming { get; set; }
 
 	private void ApplyWeaponActive()
 	{
@@ -363,7 +357,6 @@ public partial class WeaponAnimation : Node3D
 		ResolveFireSelector();
 	}
 
-
 	private void GenerateWeaponRestPose()
 	{
 		if (_player == null || _skeleton == null || _player.HasAnimation("common/A_TFA_WEP_AR_Reference"))
@@ -414,12 +407,6 @@ public partial class WeaponAnimation : Node3D
 			ReferencePose = "common/A_TFA_WEP_AR_Reference";
 	}
 
-	public void SetMagazineFill(float fill01)
-	{
-		_mainMagAnim?.SetFill(fill01);
-		_reserveMagAnim?.SetFill(fill01);
-	}
-
 	private CollisionObject3D FindOwnerBody()
 	{
 		Node n = GetParent();
@@ -462,29 +449,6 @@ public partial class WeaponAnimation : Node3D
 			r.Animation = ReferencePose;
 	}
 
-	public void SetFireMode(string name)
-	{
-		if (FireModes == null || string.IsNullOrEmpty(name) || !FireModes.ContainsKey(name))
-			return;
-		ActualFireMode = name;
-		_fireSelectorTime = FireModes[name].AsSingle();
-	}
-
-	public void CycleFireMode()
-	{
-		if (FireModes == null || FireModes.Count == 0)
-			return;
-		var keys = new List<string>();
-		foreach (var k in FireModes.Keys)
-			keys.Add(k.AsString());
-		int cur = keys.IndexOf(ActualFireMode);
-		SetFireMode(keys[(cur + 1) % keys.Count]);
-	}
-
-	private Animation _fireSelectorAnim;
-	private int[] _fireSelectorTracks = [];
-	private float _fireSelectorTime;
-
 	/// <summary>Pre-resolves the FireModeStates anim, its Fire_Selector tracks, and the mode time so the per-frame pass is allocation-free.</summary>
 	private void ResolveFireSelector()
 	{
@@ -500,30 +464,6 @@ public partial class WeaponAnimation : Node3D
 		_fireSelectorTracks = [.. tracks];
 		_fireSelectorTime = FireModes != null && FireModes.ContainsKey(ActualFireMode)
 			? FireModes[ActualFireMode].AsSingle() : 0f;
-	}
-
-	/// <summary>Overrides the Fire_Selector bone to match ActualFireMode. Called by FireSelectorModifier post-mix so it survives the tree's bone writes.</summary>
-	public void ApplyFireSelectorPose()
-	{
-		var anim = _fireSelectorAnim;
-		if (anim == null || _skeleton == null)
-			return;
-		float t = _fireSelectorTime;
-		foreach (int i in _fireSelectorTracks)
-		{
-			switch (anim.TrackGetType(i))
-			{
-				case Animation.TrackType.Rotation3D:
-					_skeleton.SetBonePoseRotation(_fireSelectorBone, anim.RotationTrackInterpolate(i, t));
-					break;
-				case Animation.TrackType.Position3D:
-					_skeleton.SetBonePosePosition(_fireSelectorBone, anim.PositionTrackInterpolate(i, t));
-					break;
-				case Animation.TrackType.Scale3D:
-					_skeleton.SetBonePoseScale(_fireSelectorBone, anim.ScaleTrackInterpolate(i, t));
-					break;
-			}
-		}
 	}
 
 	private void EditorRebuildTree()
@@ -554,27 +494,7 @@ public partial class WeaponAnimation : Node3D
 			_reserveMag.Visible = false;
 	}
 
-	// Safety net: restore mags to idle when any event clip finishes, in case the restore key is missed.
 	private void OnEventAnimFinished(StringName _) => ResetMagazines();
-
-	public void PlayAction(StringName anim, string eventAnim = null)
-	{
-		ResetMagazines();
-		if (_tree != null && _actionAnim != null && HasAnim(anim))
-		{
-			_actionAnim.Animation = anim;
-			_tree.Set(_pActionRequest, (int)AnimationNodeOneShot.OneShotRequest.Fire);
-		}
-		if (eventAnim != null && _eventPlayer != null && _eventPlayer.HasAnimation(eventAnim))
-		{
-			// Re-firing the same clip must restart from 0 so its t=0 keys (shot sound, casing) replay.
-			if (_eventPlayer.CurrentAnimation == eventAnim)
-				_eventPlayer.Stop();
-			_eventPlayer.Play(eventAnim);
-		}
-		else if (eventAnim != null)
-			GD.PrintErr($"[WeaponAnimation] event skip: player={_eventPlayer != null}, anim='{eventAnim}', has={_eventPlayer?.HasAnimation(eventAnim)}");
-	}
 
 	private void EnsureTree()
 	{
@@ -585,84 +505,12 @@ public partial class WeaponAnimation : Node3D
 	private void EditorPlay(StringName anim, string eventAnim = null)
 	{
 		EnsureTree();
-		ActivateWeapon();   // editor preview: tree self-runs on Idle
+		ActivateWeapon();
 		PlayAction(anim, eventAnim);
 	}
 
-	public bool Aiming { get; set; }
-	private bool IsTPS => Mode == WeaponMode.TPS;
 	private StringName Aimed(StringName hip, StringName aimed) =>
 		Aiming && !string.IsNullOrEmpty(aimed?.ToString()) ? aimed : hip;
-
-	public void Fire() => PlayAction(IsTPS ? TpFire : FpFire, EvFire);
-	public void Reload() => PlayAction(IsTPS ? Aimed(TpReload, TpReloadAimed) : Aimed(FpReload, FpReloadAimed), EvReload);
-	public void ReloadEmpty() => PlayAction(IsTPS ? Aimed(TpReloadEmpty, TpReloadEmptyAimed) : Aimed(FpReloadEmpty, FpReloadEmptyAimed), EvReloadEmpty);
-	public void ReloadQuick() => PlayAction(IsTPS ? Aimed(TpReloadQuick, TpReloadQuickAimed) : Aimed(FpReloadQuick, FpReloadQuickAimed), EvReloadQuick);
-	public void Inspect() => PlayAction(IsTPS ? TpInspect : FpInspect, EvInspect);
-	public void MagCheck() => PlayAction(IsTPS ? Aimed(TpMagCheck, TpMagCheckAimed) : Aimed(FpMagCheck, FpMagCheckAimed), EvMagCheck);
-	public void Equip() => PlayAction(IsTPS ? TpEquip : FpEquip, EvEquip);
-	public void ClearJamMagSwipe() => PlayAction(IsTPS ? TpClearJamMagSwipe : FpClearJamMagSwipe, EvClearJamMagSwipe);
-	public void ClearJamRack() => PlayAction(IsTPS ? TpClearJamRack : FpClearJamRack, EvClearJamRack);
-	public string[] GetPreloadList()
-	{
-		var paths = new HashSet<string>();
-
-		void Add(AudioStream[] arr)
-		{
-			if (arr == null)
-				return;
-			foreach (var s in arr)
-			{
-				if (s != null && !string.IsNullOrEmpty(s.ResourcePath))
-					paths.Add(s.ResourcePath);
-			}
-		}
-
-		Add(AudioFire);
-		Add(AudioFireTail);
-		Add(AudioEmptyCasing);
-		Add(AudioClick);
-		Add(AudioFoleyCloth);
-		Add(AudioBoltOpen);
-		Add(AudioBoltClose);
-		Add(AudioGunSmack);
-		Add(AudioMalfunction);
-		Add(AudioMagInsert);
-		Add(AudioMagRemoveFull);
-		Add(AudioMagRemoveEmpty);
-
-		if (EjectCasingScene != null && !string.IsNullOrEmpty(EjectCasingScene.ResourcePath))
-			paths.Add(EjectCasingScene.ResourcePath);
-
-		return [.. paths];
-	}
-
-	public Dictionary<string, string[]> GetAttachments()
-	{
-		var groups = new Dictionary<string, List<string>>();
-
-		void Scan(Node node)
-		{
-			foreach (Node child in node.GetChildren())
-			{
-				if (child is WeaponAttachment wa)
-				{
-					var key = wa.Group.ToString();
-					if (!groups.ContainsKey(key))
-						groups[key] = [];
-					groups[key].Add(GetPathTo(wa).ToString());
-				}
-				Scan(child);
-			}
-		}
-
-		Scan(this);
-
-		var result = new Dictionary<string, string[]>(groups.Count);
-		foreach (var kv in groups)
-			result[kv.Key] = kv.Value.ToArray();
-		return result;
-	}
 
 	private void BuildAudioPool()
 	{
@@ -722,105 +570,12 @@ public partial class WeaponAnimation : Node3D
 		Log($"{label} (vol={volume:0.##})");
 	}
 
-	public virtual void PlayAudioClick() => PlayRandom(AudioClick, VolumeClick);
-	public virtual void PlayAudioFire() => PlayRandom(AudioFire, VolumeFire);
-	public virtual void PlayAudioFireTail() => PlayRandom(AudioFireTail, VolumeFireTail);
-	public virtual void PlayAudioBoltClose() => PlayRandom(AudioBoltClose, VolumeBoltClose);
-	public virtual void PlayAudioBoltOpen() => PlayRandom(AudioBoltOpen, VolumeBoltOpen);
-	public virtual void PlayAudioGunSmack() => PlayRandom(AudioGunSmack, VolumeGunSmack);
-	public virtual void PlayAudioFoleyCloth() => PlayRandom(AudioFoleyCloth, VolumeFoleyCloth);
-	public virtual void PlayAudioMagInsert() => PlayRandom(AudioMagInsert, VolumeMagInsert);
-	public virtual void PlayAudioMagRemoveFull() => PlayRandom(AudioMagRemoveFull, VolumeMagRemoveFull);
-	public virtual void PlayAudioMagRemoveEmpty() => PlayRandom(AudioMagRemoveEmpty, VolumeMagRemoveEmpty);
-	public virtual void PlayAudioEmptyCasing() => PlayRandom(AudioEmptyCasing, VolumeEmptyCasing);
-	public virtual void PlayAudioMalfunction() => PlayRandom(AudioMalfunction, VolumeMalfunction);
-	// Reprojects a viewmodel-world transform into the main world (identity on TPS), keeping screen position.
 	private Transform3D RemapToWorld(Transform3D vmSpace)
 	{
 		if (RemapFromCamera != null && GodotObject.IsInstanceValid(RemapFromCamera)
 			&& RemapToCamera != null && GodotObject.IsInstanceValid(RemapToCamera))
 			return RemapToCamera.GlobalTransform * RemapFromCamera.GlobalTransform.AffineInverse() * vmSpace;
 		return vmSpace;
-	}
-
-	public virtual void EjectCasing()
-	{
-		Log("EjectCasing");
-		if (_bulletPool == null || _skeleton == null || _ejectionBone < 0)
-			return;
-		var bullet = _bulletPool[_bulletPoolIdx];
-		_bulletPoolIdx = (_bulletPoolIdx + 1) % _bulletPool.Length;
-		if (bullet == null)
-			return;
-
-		var boneWorld = RemapToWorld(_skeleton.GlobalTransform * _skeleton.GetBoneGlobalPose(_ejectionBone));
-		var randEuler = new Vector3(
-			Mathf.DegToRad((float)GD.RandRange(EjectMinRotation.X, EjectMaxRotation.X)),
-			Mathf.DegToRad((float)GD.RandRange(EjectMinRotation.Y, EjectMaxRotation.Y)),
-			Mathf.DegToRad((float)GD.RandRange(EjectMinRotation.Z, EjectMaxRotation.Z))
-		);
-		var dir = (boneWorld.Basis * Basis.FromEuler(randEuler) * EjectDirectionLocal).Normalized();
-		var randomUnit = new Vector3((float)GD.RandRange(-1f, 1f), (float)GD.RandRange(-1f, 1f), (float)GD.RandRange(-1f, 1f)).Normalized();
-
-		bullet.Launch(
-			boneWorld,
-			dir * (float)GD.RandRange(EjectMinForce, EjectMaxForce) + randomUnit,
-			dir * Mathf.DegToRad(EjectRotationSpeed),
-			EjectLifetime
-		);
-	}
-	public virtual void HideMainMag()
-	{
-		Log(_mainMag != null ? "HideMainMag" : "HideMainMag — _mainMag NULL");
-		if (_mainMag != null)
-			_mainMag.Visible = false;
-	}
-	public virtual void ShowMainMag()
-	{
-		Log(_mainMag != null ? "ShowMainMag" : "ShowMainMag — _mainMag NULL");
-		if (_mainMag != null)
-			_mainMag.Visible = true;
-	}
-	public virtual void ShowReserveMag()
-	{
-		Log(_reserveMag != null ? "ShowReserveMag" : "ShowReserveMag — _reserveMag NULL");
-		if (_reserveMag != null)
-			_reserveMag.Visible = true;
-	}
-	public virtual void HideReserveMag()
-	{
-		Log(_reserveMag != null ? "HideReserveMag" : "HideReserveMag — _reserveMag NULL");
-		if (_reserveMag != null)
-			_reserveMag.Visible = false;
-	}
-	public virtual void DropMagazine()
-	{
-		if (_mainMag == null)
-		{ Log("DropMagazine — _mainMag NULL"); return; }
-
-		MeshInstance3D srcMesh = FindMesh(_mainMag);
-		Transform3D spawn = RemapToWorld(srcMesh != null ? srcMesh.GlobalTransform : _mainMag.GlobalTransform);
-
-		RigidBody3D mag = DropMagazineScene?.Instantiate() as RigidBody3D ?? BuildRuntimeMagBody(srcMesh);
-		if (mag == null)
-		{ Log("DropMagazine — no DropMagazineScene and no mag mesh to build from"); return; }
-
-		// Dropped mag must collide and simulate (in-socket mags default to frozen/non-colliding).
-		if (mag is AnimatedMagazin am)
-			am.CollisionEnabled = true;
-		GetTree().CurrentScene.AddChild(mag);
-		mag.Freeze = false;
-		mag.CollisionLayer = 1u << 3;   // DEBRIS layer; players don't collide with dropped mags
-		mag.CollisionMask = 1u;         // collide with WORLD only so it rests on the floor
-		mag.GlobalTransform = spawn;
-		mag.LinearVelocity = spawn.Basis.Y.Normalized() * DropImpulseForce;
-		Vector3 axis = new Vector3(
-			(float)GD.RandRange(-1.0, 1.0),
-			(float)GD.RandRange(-1.0, 1.0),
-			(float)GD.RandRange(-1.0, 1.0)).Normalized();
-		mag.AngularVelocity = axis * Mathf.DegToRad(DropRotationForce);
-		Log($"DropMagazine @ {spawn.Origin}");
-		GetTree().CreateTimer(DropMagazineLifetime).Timeout += () => { if (IsInstanceValid(mag)) mag.QueueFree(); };
 	}
 
 	private static MeshInstance3D FindMesh(Node root)
@@ -846,15 +601,6 @@ public partial class WeaponAnimation : Node3D
 		return body;
 	}
 
-	// Main-world barrel tip for tracers/muzzle FX (reprojected for FPS viewmodel, identity on TPS). Resolved per call so handguard swaps are picked up.
-	public Vector3 GetMuzzleWorldPosition()
-	{
-		Node3D tip = FindMuzzleTip(this);
-		Vector3 pos = tip != null ? tip.GlobalPosition : GlobalPosition;
-		return RemapToWorld(new Transform3D(Basis.Identity, pos)).Origin;
-	}
-
-	// Active variant's visible "Muzzle" node -> its "SOCKET_Emitter" tip; gates on Muzzle visibility (emitter may hang under a hidden silencer mesh).
 	private static Node3D FindMuzzleTip(Node root)
 	{
 		Node3D muzzle = FindVisibleNamed(root, "Muzzle");
@@ -889,55 +635,63 @@ public partial class WeaponAnimation : Node3D
 		return null;
 	}
 
-	private GpuParticles3D _muzzleSmoke;
-	private Transform3D _pendingSmokeMuzzle;
-	private int _smokeBurstGen;
-	private const float SmokeTrailDelay = 0.13f;
+	private Material ResolveSmokeMaterial()
+	{
+		if (_smokeMaterial != null)
+			return _smokeMaterial;
+		Material mat = MuzzleSmokeMaterial ?? ResourceLoader.Load<Material>(DefaultSmokeMaterialPath);
+		if (mat is ShaderMaterial sm)
+		{
+			var perWeapon = (ShaderMaterial)sm.Duplicate();
+			perWeapon.SetShaderParameter("emission_baseline", MuzzleSmokeLightTransmittance);
+			mat = perWeapon;
+		}
+		_smokeMaterial = mat;
+		return _smokeMaterial;
+	}
 
-	// Muzzle smoke puff. Lives in the MAIN world (not the FPS SubViewport), LocalCoords=false so particles
-	// hang where fired; EmitSmokePuff teleports the emitter to the remapped muzzle.
 	private void BuildMuzzleSmoke()
 	{
 		if (NetMain.Instance?.Cli?.Mode == NetMode.Server)
 			return;
-		var mat = ResourceLoader.Load<Material>("res://fx/muzzle_smoke/smoke.tres");
+		Material mat = ResolveSmokeMaterial();
 		if (mat == null)
 			return;
 
 		var ppm = new ParticleProcessMaterial
 		{
-			Direction = new Vector3(0, 0.12f, -1),   // out the barrel, slightly up
-			Spread = 28f,                            // wide cone = wispy plume, not a sphere
-			InitialVelocityMin = 0.6f,
-			InitialVelocityMax = 1.5f,               // forward push elongates into a barrel plume
-			Gravity = new Vector3(0, 1.1f, 0),       // buoys up after the forward shove, not straight up
+			Direction = new Vector3(0, 0.12f, -1),
+			Spread = MuzzleSmokeSpread,
+			InitialVelocityMin = MuzzleSmokeSpeed * 0.4f,
+			InitialVelocityMax = MuzzleSmokeSpeed,
+			Gravity = new Vector3(0, 1.1f, 0),
 			LinearAccelMin = 0f,
 			LinearAccelMax = 0f,
 			DampingMin = 1.4f,
-			DampingMax = 2.6f,                        // shove dies fast, then buoyancy lifts the puff
+			DampingMax = 2.6f,
 			ScaleMin = 2.7f,
-			ScaleMax = 3.8f,                          // one big mass
-			ScaleCurve = MakeCurve((0f, 0.4f), (0.25f, 1f), (1f, 2.2f)),    // blooms fast, keeps growing as it thins
-			Color = new Color(0.6f, 0.61f, 0.64f, 1f),                     // light cool grey
-			AlphaCurve = MakeCurve((0f, 0f), (0.12f, 0.065f), (1f, 0f)),   // thin, slow fade-out
+			ScaleMax = 3.8f,
+			ScaleCurve = MakeCurve((0f, 0.4f), (0.25f, 1f), (1f, 2.2f)),
+			Color = new Color(0.6f, 0.61f, 0.64f, 1f),
+			AlphaCurve = MakeCurve((0f, 0f), (0.12f, MuzzleSmokeDensity), (1f, 0f)),
 			AngleMin = -360f,
 			AngleMax = 360f,
 			AnimOffsetMax = 1f,
-			InheritVelocityRatio = 0f,                // emitter teleports per shot; inheriting that delta would fling particles
+			InheritVelocityRatio = 0f,
 		};
 		ppm.SetParticleFlag(ParticleProcessMaterial.ParticleFlags.DampingAsFriction, true);
 
 		_muzzleSmoke = new GpuParticles3D
 		{
 			Name = "MuzzleSmoke",
-			Amount = 5,                                // a few staggered cards = a trailing plume
+			Amount = 5,
 			Lifetime = 1.0,
 			OneShot = true,
 			Emitting = false,
 			LocalCoords = false,
-			Explosiveness = 0.7f,                      // slight stagger = a short trail, not an instant pop
+			Explosiveness = 0.7f,
 			ProcessMaterial = ppm,
-			DrawPass1 = new QuadMesh { Size = new Vector2(0.6f, 0.6f) },
+			DrawPass1 = new QuadMesh { Size = MuzzleSmokeSize },
 			MaterialOverride = mat,
 		};
 		GetTree().CurrentScene.CallDeferred(Node.MethodName.AddChild, _muzzleSmoke);
@@ -951,26 +705,6 @@ public partial class WeaponAnimation : Node3D
 		_muzzleSmoke.Restart();
 	}
 
-	/// <summary>Records the muzzle transform and re-arms the smoke puff after SmokeTrailDelay so full-auto yields one cloud after the last round. Cosmetic.</summary>
-	public void MuzzleSmoke()
-	{
-		if (_muzzleSmoke == null || !GodotObject.IsInstanceValid(_muzzleSmoke))
-			BuildMuzzleSmoke();
-		if (_muzzleSmoke == null || !_muzzleSmoke.IsInsideTree())
-			return;
-		Node3D tip = FindMuzzleTip(this);
-		Transform3D muzzle = RemapToWorld(tip != null ? tip.GlobalTransform : GlobalTransform);
-		_pendingSmokeMuzzle = new Transform3D(muzzle.Basis.Orthonormalized(), muzzle.Origin);
-
-		int gen = ++_smokeBurstGen;
-		var timer = GetTree().CreateTimer(SmokeTrailDelay);
-		timer.Timeout += () =>
-		{
-			if (gen == _smokeBurstGen)
-				EmitSmokePuff();
-		};
-	}
-
 	private static CurveTexture MakeCurve(params (float X, float Y)[] points)
 	{
 		var c = new Curve();
@@ -979,19 +713,6 @@ public partial class WeaponAnimation : Node3D
 		return new CurveTexture { Curve = c };
 	}
 
-	private GpuParticles3D _muzzleFlash;
-	private OmniLight3D _muzzleLight;
-	private const string MuzzleFlameTexture = "res://assets/weapons/ar15/textures/T_TFA_MuzzleFlash_Flame_E.EXR";
-	private const float MuzzleFlashSize = 0.52f;
-	private const float MuzzleFlashEnergy = 0.75f;
-	private const float MuzzleFlashSaturation = 0.45f;
-	private const float MuzzleFlashLightEnergy = 1.5f;
-	private const int MuzzleFlashHFrames = 8;
-	private const int MuzzleFlashVFrames = 8;
-	private static readonly Color MuzzleFlashColor = new(1f, 0.72f, 0.35f);
-
-	// Textured muzzle flash: additive flame card + point-light pulse. Lives in the MAIN world (not the FPS SubViewport),
-	// teleported to the reprojected muzzle per shot so the light hits the real environment.
 	private void BuildMuzzleFlash()
 	{
 		if (NetMain.Instance?.Cli?.Mode == NetMode.Server)
@@ -1051,7 +772,371 @@ public partial class WeaponAnimation : Node3D
 		GetTree().CurrentScene.CallDeferred(Node.MethodName.AddChild, _muzzleFlash);
 	}
 
-	/// <summary>Per-shot muzzle flash: teleports the flame card + light to the reprojected barrel tip and pulses the light. Cosmetic.</summary>
+	/// <summary>True on every Nth fired round; advances the shot counter, so call exactly once per fired round.</summary>
+	public bool ShouldSpawnTracer() => TracerEnabled && _tracerShotCount++ % Mathf.Max(1, TracerEveryNShots) == 0;
+
+	/// <summary>Editor: turns the animation/event-name fields into enum dropdowns and lists the audio buses.</summary>
+	public override void _ValidateProperty(Godot.Collections.Dictionary property)
+	{
+		string name = (string)property["name"];
+		if (AnimProps.Contains(name))
+		{
+			var player = GetNodeOrNull<AnimationPlayer>(AnimationPlayerPath);
+			if (player == null)
+				return;
+			property["hint"] = (int)PropertyHint.Enum;
+			property["hint_string"] = string.Join(",", player.GetAnimationList());
+		}
+		else if (EventProps.Contains(name))
+		{
+			var ep = GetNodeOrNull<AnimationPlayer>(EventPlayerPath);
+			if (ep == null)
+				return;
+			property["hint"] = (int)PropertyHint.Enum;
+			property["hint_string"] = string.Join(",", ep.GetAnimationList());
+		}
+		else if (name == nameof(AudioBus))
+		{
+			var buses = new string[AudioServer.BusCount];
+			for (int i = 0; i < buses.Length; i++)
+				buses[i] = AudioServer.GetBusName(i);
+			property["hint"] = (int)PropertyHint.Enum;
+			property["hint_string"] = string.Join(",", buses);
+		}
+	}
+
+	/// <summary>Builds the animation tree and the muzzle smoke/flash effects (skipped on the server).</summary>
+	public override void _Ready()
+	{
+		if (Engine.IsEditorHint())
+			return;
+		BuildAnimationTree();
+		BuildMuzzleSmoke();
+		BuildMuzzleFlash();
+	}
+
+	/// <summary>Switches the tree callback to Idle. Inactive instances stay Manual (frozen, zero cost).</summary>
+	public void ActivateWeapon() { _weaponActive = true; ApplyWeaponActive(); }
+
+	/// <summary>Freezes animation (tree back to Manual).</summary>
+	public void DeactivateWeapon() { _weaponActive = false; ApplyWeaponActive(); }
+
+	/// <summary>Sets the visible round fill (0..1) on the main and reserve magazines.</summary>
+	public void SetMagazineFill(float fill01)
+	{
+		_mainMagAnim?.SetFill(fill01);
+		_reserveMagAnim?.SetFill(fill01);
+	}
+
+	/// <summary>Selects the named fire mode and updates the selector pose.</summary>
+	public void SetFireMode(string name)
+	{
+		if (FireModes == null || string.IsNullOrEmpty(name) || !FireModes.ContainsKey(name))
+			return;
+		ActualFireMode = name;
+		_fireSelectorTime = FireModes[name].AsSingle();
+	}
+
+	/// <summary>Advances to the next fire mode.</summary>
+	public void CycleFireMode()
+	{
+		if (FireModes == null || FireModes.Count == 0)
+			return;
+		var keys = new List<string>();
+		foreach (var k in FireModes.Keys)
+			keys.Add(k.AsString());
+		int cur = keys.IndexOf(ActualFireMode);
+		SetFireMode(keys[(cur + 1) % keys.Count]);
+	}
+
+	/// <summary>Overrides the fire-selector bone to match the current mode; runs post-mix so it survives the tree's writes.</summary>
+	public void ApplyFireSelectorPose()
+	{
+		var anim = _fireSelectorAnim;
+		if (anim == null || _skeleton == null)
+			return;
+		float t = _fireSelectorTime;
+		foreach (int i in _fireSelectorTracks)
+		{
+			switch (anim.TrackGetType(i))
+			{
+				case Animation.TrackType.Rotation3D:
+					_skeleton.SetBonePoseRotation(_fireSelectorBone, anim.RotationTrackInterpolate(i, t));
+					break;
+				case Animation.TrackType.Position3D:
+					_skeleton.SetBonePosePosition(_fireSelectorBone, anim.PositionTrackInterpolate(i, t));
+					break;
+				case Animation.TrackType.Scale3D:
+					_skeleton.SetBonePoseScale(_fireSelectorBone, anim.ScaleTrackInterpolate(i, t));
+					break;
+			}
+		}
+	}
+
+	/// <summary>Plays an action one-shot on the tree and its matching event clip.</summary>
+	public void PlayAction(StringName anim, string eventAnim = null)
+	{
+		ResetMagazines();
+		if (_tree != null && _actionAnim != null && HasAnim(anim))
+		{
+			_actionAnim.Animation = anim;
+			_tree.Set(_pActionRequest, (int)AnimationNodeOneShot.OneShotRequest.Fire);
+		}
+		if (eventAnim != null && _eventPlayer != null && _eventPlayer.HasAnimation(eventAnim))
+		{
+			if (_eventPlayer.CurrentAnimation == eventAnim)
+				_eventPlayer.Stop();
+			_eventPlayer.Play(eventAnim);
+		}
+		else if (eventAnim != null)
+			GD.PrintErr($"[WeaponAnimation] event skip: player={_eventPlayer != null}, anim='{eventAnim}', has={_eventPlayer?.HasAnimation(eventAnim)}");
+	}
+
+	/// <summary>Plays the fire action.</summary>
+	public void Fire() => PlayAction(IsTPS ? TpFire : FpFire, EvFire);
+
+	/// <summary>Plays the reload action (aimed variant when aiming).</summary>
+	public void Reload() => PlayAction(IsTPS ? Aimed(TpReload, TpReloadAimed) : Aimed(FpReload, FpReloadAimed), EvReload);
+
+	/// <summary>Plays the empty-reload action.</summary>
+	public void ReloadEmpty() => PlayAction(IsTPS ? Aimed(TpReloadEmpty, TpReloadEmptyAimed) : Aimed(FpReloadEmpty, FpReloadEmptyAimed), EvReloadEmpty);
+
+	/// <summary>Plays the quick-reload action.</summary>
+	public void ReloadQuick() => PlayAction(IsTPS ? Aimed(TpReloadQuick, TpReloadQuickAimed) : Aimed(FpReloadQuick, FpReloadQuickAimed), EvReloadQuick);
+
+	/// <summary>Plays the inspect action.</summary>
+	public void Inspect() => PlayAction(IsTPS ? TpInspect : FpInspect, EvInspect);
+
+	/// <summary>Plays the mag-check action.</summary>
+	public void MagCheck() => PlayAction(IsTPS ? Aimed(TpMagCheck, TpMagCheckAimed) : Aimed(FpMagCheck, FpMagCheckAimed), EvMagCheck);
+
+	/// <summary>Plays the equip action.</summary>
+	public void Equip() => PlayAction(IsTPS ? TpEquip : FpEquip, EvEquip);
+
+	/// <summary>Plays the mag-swipe jam-clear action.</summary>
+	public void ClearJamMagSwipe() => PlayAction(IsTPS ? TpClearJamMagSwipe : FpClearJamMagSwipe, EvClearJamMagSwipe);
+
+	/// <summary>Plays the rack jam-clear action.</summary>
+	public void ClearJamRack() => PlayAction(IsTPS ? TpClearJamRack : FpClearJamRack, EvClearJamRack);
+
+	/// <summary>Resource paths (audio and casing scene) to preload for this weapon.</summary>
+	public string[] GetPreloadList()
+	{
+		var paths = new HashSet<string>();
+
+		void Add(AudioStream[] arr)
+		{
+			if (arr == null)
+				return;
+			foreach (var s in arr)
+			{
+				if (s != null && !string.IsNullOrEmpty(s.ResourcePath))
+					paths.Add(s.ResourcePath);
+			}
+		}
+
+		Add(AudioFire);
+		Add(AudioFireTail);
+		Add(AudioEmptyCasing);
+		Add(AudioClick);
+		Add(AudioFoleyCloth);
+		Add(AudioBoltOpen);
+		Add(AudioBoltClose);
+		Add(AudioGunSmack);
+		Add(AudioMalfunction);
+		Add(AudioMagInsert);
+		Add(AudioMagRemoveFull);
+		Add(AudioMagRemoveEmpty);
+
+		if (EjectCasingScene != null && !string.IsNullOrEmpty(EjectCasingScene.ResourcePath))
+			paths.Add(EjectCasingScene.ResourcePath);
+
+		return [.. paths];
+	}
+
+	/// <summary>Maps each attachment group to the node paths of its WeaponAttachment children.</summary>
+	public Dictionary<string, string[]> GetAttachments()
+	{
+		var groups = new Dictionary<string, List<string>>();
+
+		void Scan(Node node)
+		{
+			foreach (Node child in node.GetChildren())
+			{
+				if (child is WeaponAttachment wa)
+				{
+					var key = wa.Group.ToString();
+					if (!groups.ContainsKey(key))
+						groups[key] = [];
+					groups[key].Add(GetPathTo(wa).ToString());
+				}
+				Scan(child);
+			}
+		}
+
+		Scan(this);
+
+		var result = new Dictionary<string, string[]>(groups.Count);
+		foreach (var kv in groups)
+			result[kv.Key] = kv.Value.ToArray();
+		return result;
+	}
+
+	/// <summary>Plays a random dry-fire click.</summary>
+	public virtual void PlayAudioClick() => PlayRandom(AudioClick, VolumeClick);
+
+	/// <summary>Plays a random fire shot.</summary>
+	public virtual void PlayAudioFire() => PlayRandom(AudioFire, VolumeFire);
+
+	/// <summary>Plays a random fire tail.</summary>
+	public virtual void PlayAudioFireTail() => PlayRandom(AudioFireTail, VolumeFireTail);
+
+	/// <summary>Plays a random bolt-close sound.</summary>
+	public virtual void PlayAudioBoltClose() => PlayRandom(AudioBoltClose, VolumeBoltClose);
+
+	/// <summary>Plays a random bolt-open sound.</summary>
+	public virtual void PlayAudioBoltOpen() => PlayRandom(AudioBoltOpen, VolumeBoltOpen);
+
+	/// <summary>Plays a random gun-smack sound.</summary>
+	public virtual void PlayAudioGunSmack() => PlayRandom(AudioGunSmack, VolumeGunSmack);
+
+	/// <summary>Plays a random cloth foley sound.</summary>
+	public virtual void PlayAudioFoleyCloth() => PlayRandom(AudioFoleyCloth, VolumeFoleyCloth);
+
+	/// <summary>Plays a random mag-insert sound.</summary>
+	public virtual void PlayAudioMagInsert() => PlayRandom(AudioMagInsert, VolumeMagInsert);
+
+	/// <summary>Plays a random full-mag removal sound.</summary>
+	public virtual void PlayAudioMagRemoveFull() => PlayRandom(AudioMagRemoveFull, VolumeMagRemoveFull);
+
+	/// <summary>Plays a random empty-mag removal sound.</summary>
+	public virtual void PlayAudioMagRemoveEmpty() => PlayRandom(AudioMagRemoveEmpty, VolumeMagRemoveEmpty);
+
+	/// <summary>Plays a random empty-casing sound.</summary>
+	public virtual void PlayAudioEmptyCasing() => PlayRandom(AudioEmptyCasing, VolumeEmptyCasing);
+
+	/// <summary>Plays a random malfunction sound.</summary>
+	public virtual void PlayAudioMalfunction() => PlayRandom(AudioMalfunction, VolumeMalfunction);
+
+	/// <summary>Launches a pooled casing from the eject bone.</summary>
+	public virtual void EjectCasing()
+	{
+		Log("EjectCasing");
+		if (_bulletPool == null || _skeleton == null || _ejectionBone < 0)
+			return;
+		var bullet = _bulletPool[_bulletPoolIdx];
+		_bulletPoolIdx = (_bulletPoolIdx + 1) % _bulletPool.Length;
+		if (bullet == null)
+			return;
+
+		var boneWorld = RemapToWorld(_skeleton.GlobalTransform * _skeleton.GetBoneGlobalPose(_ejectionBone));
+		var randEuler = new Vector3(
+			Mathf.DegToRad((float)GD.RandRange(EjectMinRotation.X, EjectMaxRotation.X)),
+			Mathf.DegToRad((float)GD.RandRange(EjectMinRotation.Y, EjectMaxRotation.Y)),
+			Mathf.DegToRad((float)GD.RandRange(EjectMinRotation.Z, EjectMaxRotation.Z))
+		);
+		var dir = (boneWorld.Basis * Basis.FromEuler(randEuler) * EjectDirectionLocal).Normalized();
+		var randomUnit = new Vector3((float)GD.RandRange(-1f, 1f), (float)GD.RandRange(-1f, 1f), (float)GD.RandRange(-1f, 1f)).Normalized();
+
+		bullet.Launch(
+			boneWorld,
+			dir * (float)GD.RandRange(EjectMinForce, EjectMaxForce) + randomUnit,
+			dir * Mathf.DegToRad(EjectRotationSpeed),
+			EjectLifetime
+		);
+	}
+
+	/// <summary>Hides the main magazine mesh.</summary>
+	public virtual void HideMainMag()
+	{
+		Log(_mainMag != null ? "HideMainMag" : "HideMainMag — _mainMag NULL");
+		if (_mainMag != null)
+			_mainMag.Visible = false;
+	}
+
+	/// <summary>Shows the main magazine mesh.</summary>
+	public virtual void ShowMainMag()
+	{
+		Log(_mainMag != null ? "ShowMainMag" : "ShowMainMag — _mainMag NULL");
+		if (_mainMag != null)
+			_mainMag.Visible = true;
+	}
+
+	/// <summary>Shows the reserve magazine mesh.</summary>
+	public virtual void ShowReserveMag()
+	{
+		Log(_reserveMag != null ? "ShowReserveMag" : "ShowReserveMag — _reserveMag NULL");
+		if (_reserveMag != null)
+			_reserveMag.Visible = true;
+	}
+
+	/// <summary>Hides the reserve magazine mesh.</summary>
+	public virtual void HideReserveMag()
+	{
+		Log(_reserveMag != null ? "HideReserveMag" : "HideReserveMag — _reserveMag NULL");
+		if (_reserveMag != null)
+			_reserveMag.Visible = false;
+	}
+
+	/// <summary>Spawns a physics-simulated dropped magazine at the mag socket.</summary>
+	public virtual void DropMagazine()
+	{
+		if (_mainMag == null)
+		{ Log("DropMagazine — _mainMag NULL"); return; }
+
+		MeshInstance3D srcMesh = FindMesh(_mainMag);
+		Transform3D spawn = RemapToWorld(srcMesh != null ? srcMesh.GlobalTransform : _mainMag.GlobalTransform);
+
+		RigidBody3D mag = DropMagazineScene?.Instantiate() as RigidBody3D ?? BuildRuntimeMagBody(srcMesh);
+		if (mag == null)
+		{ Log("DropMagazine — no DropMagazineScene and no mag mesh to build from"); return; }
+
+		if (mag is AnimatedMagazin am)
+			am.CollisionEnabled = true;
+		GetTree().CurrentScene.AddChild(mag);
+		mag.Freeze = false;
+		mag.CollisionLayer = 1u << 3;
+		mag.CollisionMask = 1u;
+		mag.GlobalTransform = spawn;
+		mag.LinearVelocity = spawn.Basis.Y.Normalized() * DropImpulseForce;
+		Vector3 axis = new Vector3(
+			(float)GD.RandRange(-1.0, 1.0),
+			(float)GD.RandRange(-1.0, 1.0),
+			(float)GD.RandRange(-1.0, 1.0)).Normalized();
+		mag.AngularVelocity = axis * Mathf.DegToRad(DropRotationForce);
+		Log($"DropMagazine @ {spawn.Origin}");
+		GetTree().CreateTimer(DropMagazineLifetime).Timeout += () => { if (IsInstanceValid(mag)) mag.QueueFree(); };
+	}
+
+	/// <summary>Main-world barrel-tip position for tracers and muzzle effects.</summary>
+	public Vector3 GetMuzzleWorldPosition()
+	{
+		Node3D tip = FindMuzzleTip(this);
+		Vector3 pos = tip != null ? tip.GlobalPosition : GlobalPosition;
+		return RemapToWorld(new Transform3D(Basis.Identity, pos)).Origin;
+	}
+
+	/// <summary>Records the muzzle transform and emits one smoke puff shortly after the burst.</summary>
+	public void MuzzleSmoke()
+	{
+		if (_muzzleSmoke == null || !GodotObject.IsInstanceValid(_muzzleSmoke))
+			BuildMuzzleSmoke();
+		if (_muzzleSmoke == null || !_muzzleSmoke.IsInsideTree())
+			return;
+		Node3D tip = FindMuzzleTip(this);
+		Transform3D muzzle = RemapToWorld(tip != null ? tip.GlobalTransform : GlobalTransform);
+		_pendingSmokeMuzzle = new Transform3D(muzzle.Basis.Orthonormalized(), muzzle.Origin);
+
+		int gen = ++_smokeBurstGen;
+		var timer = GetTree().CreateTimer(SmokeTrailDelay);
+		timer.Timeout += () =>
+		{
+			if (gen == _smokeBurstGen)
+				EmitSmokePuff();
+		};
+	}
+
+	/// <summary>Flashes the muzzle: places the flame card and light at the barrel tip and pulses the light.</summary>
 	public void MuzzleFlash()
 	{
 		if (_muzzleFlash == null || !GodotObject.IsInstanceValid(_muzzleFlash))

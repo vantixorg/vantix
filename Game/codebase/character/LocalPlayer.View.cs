@@ -1,3 +1,20 @@
+/*
+ * License: Apache-2.0
+ * Copyright 2026 Stefan Kalysta (stefan@redninjas.dev)
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 using Godot;
 using System.Collections.Generic;
 
@@ -7,13 +24,103 @@ namespace Vantix.Character;
 /// ADS crosshair, editor preview. Only the local player runs this; puppets/server use UpdateTpsBodyAim.</summary>
 public partial class LocalPlayer
 {
-	/// <summary>Per-frame view chain. Called from _Process after visual interpolation, and directly for the editor preview.</summary>
+	private GrenadeAimGuide _aimGuide;
+	private readonly List<Vector3> _aimPath = new();
+	private int _aimDbg;
+
+	private static readonly StringName _pStandWalk = "parameters/StandWalk/blend_position";
+	private static readonly StringName _pAimLoco = "parameters/AimLoco/blend_position";
+	private static readonly StringName _pCrouchLoco = "parameters/CrouchLoco/blend_position";
+	private static readonly StringName _pStandRun = "parameters/StandRun/blend_amount";
+	private static readonly StringName _pStandSprint = "parameters/StandSprint/blend_amount";
+	private static readonly StringName _pAimMix = "parameters/AimMix/blend_amount";
+	private static readonly StringName _pCrouchMix = "parameters/CrouchMix/blend_amount";
+	private static readonly StringName _pGripAdd = "parameters/GripAdd/add_amount";
+	private static readonly StringName _pGripAimBlend = "parameters/GripAimBlend/blend_amount";
+	private static readonly StringName _pActionActive = "parameters/Action/active";
+	private static readonly StringName _pActionRequest = "parameters/Action/request";
+	private static readonly StringName _pLocoStopRequest = "parameters/LocoStop/request";
+	private static readonly StringName _pJumpLoopBlend = "parameters/JumpLoopBlend/blend_amount";
+	private static readonly StringName _pJumpStartRequest = "parameters/JumpStartShot/request";
+	private static readonly StringName _pJumpEndRequest = "parameters/JumpEndShot/request";
+	private static readonly StringName _pJumpAddAmount = "parameters/JumpAdd/add_amount";
+	private static readonly StringName _pInfluence = "influence";
+
+	private int _vmLastShotIndex;
+	private bool _vmWasReloading, _vmWasInspecting;
+	private float _jumpLoopBlend;
+	private float _airTime;
+	private bool _vmWasAirborne;
+	private bool _wasAirborneRaw;
+	private bool _jumpInitiated;
+	private float _fallStartY;
+	private float _airMaxFallDist;
+	private const float JumpBlendInSpeed = 12f;
+	private const float JumpBlendOutSpeed = 9f;
+
+	private Vector3 _jumpKickPos;
+	private Vector3 _jumpKickVel;
+	private float _jumpKickPitch;
+	private float _jumpKickPitchVel;
+
+	private float _stepSmoothOffset;
+	private float _smoothBodyY;
+	private bool _stepYInit;
+	private float _bobScale = 1f;
+
+	private float _sprintFovBlend;
+	private float _sprintBlurBlend;
+	private ShaderMaterial _sprintBlurMat;
+	private ColorRect _sprintBlurRect;
+	private CanvasLayer _sprintBlurLayer;
+	private static readonly StringName _pSprintShader = "sprint";
+
+	private PostProcessEffect _cachedPostFx;
+	private bool _postFxLookupDone;
+	private ShaderMaterial _viewmodelBlurMat;
+	private bool _viewmodelBlurLookupDone;
+	private static readonly StringName _pAdsBlendShader = "ads_blend";
+	private static readonly StringName _pSharpenShader = "sharpen_strength";
+
+	private Vector2 _lookDelta;
+	private float _crouchBlend;
+	private float _cantedBlend;
+	private Vector3 _swayCurrent;
+	private Vector3 _recoilVel;
+	private Transform3D _camRestLocal;
+	private Transform3D _eyeRest;
+	private bool _camRigCaptured;
+	private bool _adsTestPrev;
+	private MeshInstance3D _adsMarker, _adsLineH, _adsLineV;
+	private float _gripAimBlend;
+	private bool _montageActive;
+	private GripType _pendingGrip;
+	private float _gripSwitchDelay = -1f;
+	private float _gripBlend;
+	private bool _editorTreeReady;
+	private bool _wasNearStop = true;
+	private bool _sprintStopArmed;
+	private bool _walkStopArmed;
+	private Vector3 _smoothedDirRatio;
+	private Vector3 _dirLeanSpringVel;
+	private Vector3 _prevProcVelocity;
+	private Vector3 _inertiaTilt;
+	private float _prevBodyYaw;
+	private float _prevBodyPitch;
+	private bool _bodyYawInit;
+	private float _bodyYawLag;
+	private float _bodyPitchLag;
+	private Vector3 _mouseInertia;
+	private Vector3 _mouseInertiaSmoothed;
+	private Vector3 _viewSwayPos;
+	private Vector3 _viewSwayRotDeg;
+
 	private void RenderLocalView(double delta)
 	{
 		if (Engine.IsEditorHint())
 		{ ApplyEditorPreview((float)delta); return; }
 		if (IsDead)
-			return;   // dead = spectating a puppet cam; viewmodel hidden, not animated
+			return;
 		using var _prof = MiniProfiler.SampleClient("LocalPlayer.RenderLocalView");
 
 		float dt = (float)delta;
@@ -43,12 +150,6 @@ public partial class LocalPlayer
 		using (MiniProfiler.SampleClient("View.UpdateAimGuide")) UpdateAimGuide();
 	}
 
-	private GrenadeAimGuide _aimGuide;
-	private readonly List<Vector3> _aimPath = new();
-	private int _aimDbg;
-
-	/// <summary>Grenade trajectory preview while the grenade slot is active and fire held. Predicts from the
-	/// same pending-throw origin/velocity the sim uses on release, so it matches the real flight. Lazy on first show.</summary>
 	private void UpdateAimGuide()
 	{
 		bool show = ActiveSlot == 1 && !InputGate.Blocked
@@ -60,7 +161,7 @@ public partial class LocalPlayer
 				return;
 			_aimGuide = new GrenadeAimGuide();
 			GetParent()?.CallDeferred(Node.MethodName.AddChild, _aimGuide);
-			return;   // not in the tree until next frame; viewport/camera reads would be null
+			return;
 		}
 
 		_aimGuide.SetGuideVisible(show);
@@ -101,25 +202,6 @@ public partial class LocalPlayer
 		bool fastMovement = _sprintAmt > 0.05f || _runAmt > 0.5f;
 		_gripBlend = Mathf.MoveToward(_gripBlend, _grip != GripType.Standard && !fastMovement ? 1f : 0f, GripPoseBlendSpeed * dt);
 	}
-
-	// Cached AnimationTree param paths; avoids a string→StringName alloc per Set each frame.
-	private static readonly StringName _pStandWalk = "parameters/StandWalk/blend_position";
-	private static readonly StringName _pAimLoco = "parameters/AimLoco/blend_position";
-	private static readonly StringName _pCrouchLoco = "parameters/CrouchLoco/blend_position";
-	private static readonly StringName _pStandRun = "parameters/StandRun/blend_amount";
-	private static readonly StringName _pStandSprint = "parameters/StandSprint/blend_amount";
-	private static readonly StringName _pAimMix = "parameters/AimMix/blend_amount";
-	private static readonly StringName _pCrouchMix = "parameters/CrouchMix/blend_amount";
-	private static readonly StringName _pGripAdd = "parameters/GripAdd/add_amount";
-	private static readonly StringName _pGripAimBlend = "parameters/GripAimBlend/blend_amount";
-	private static readonly StringName _pActionActive = "parameters/Action/active";
-	private static readonly StringName _pActionRequest = "parameters/Action/request";
-	private static readonly StringName _pLocoStopRequest = "parameters/LocoStop/request";
-	private static readonly StringName _pJumpLoopBlend = "parameters/JumpLoopBlend/blend_amount";
-	private static readonly StringName _pJumpStartRequest = "parameters/JumpStartShot/request";
-	private static readonly StringName _pJumpEndRequest = "parameters/JumpEndShot/request";
-	private static readonly StringName _pJumpAddAmount = "parameters/JumpAdd/add_amount";
-	private static readonly StringName _pInfluence = "influence";
 
 	private void DriveLocomotionTree(float dt)
 	{
@@ -182,8 +264,6 @@ public partial class LocalPlayer
 		_wasNearStop = nearStopNow;
 	}
 
-	private int _vmLastShotIndex;
-	private bool _vmWasReloading, _vmWasInspecting;
 	private void UpdateViewmodelMontages()
 	{
 		if (Movement == null)
@@ -217,23 +297,6 @@ public partial class LocalPlayer
 		{ PlayOneShot(Inspect); _currentWeapon?.Inspect(); }
 		_vmWasInspecting = inspecting;
 	}
-
-	// Hybrid jump: anim deltas (Sub2/Add2) shape the arm pose, procedural spring does landing impact.
-	// See [[project_fps_jump_anim]].
-	private float _jumpLoopBlend;
-	private float _airTime;
-	private bool _vmWasAirborne;
-	private bool _wasAirborneRaw;
-	private bool _jumpInitiated;
-	private float _fallStartY;
-	private float _airMaxFallDist;
-	private const float JumpBlendInSpeed = 12f;
-	private const float JumpBlendOutSpeed = 9f;
-
-	private Vector3 _jumpKickPos;
-	private Vector3 _jumpKickVel;
-	private float _jumpKickPitch;
-	private float _jumpKickPitchVel;
 
 	private void UpdateJumpLayer(float dt)
 	{
@@ -276,8 +339,6 @@ public partial class LocalPlayer
 		Dbg.Print("[Jump] start fired");
 	}
 
-	/// <summary>Fires the landing clip + impact kick if the air cycle was a real jump/fall (jump key or fall
-	/// past JumpMinFallHeight). Returns whether it counted, so the caller can gate the landing sound the same way.</summary>
 	private bool AddLandKick(float impactSpeed)
 	{
 		if (!_jumpInitiated && _airMaxFallDist < ConVars.Cl.JumpMinFallHeight)
@@ -348,11 +409,6 @@ public partial class LocalPlayer
 
 		_lookDelta = Vector2.Zero;
 	}
-
-	private float _stepSmoothOffset;
-	private float _smoothBodyY;
-	private bool _stepYInit;
-	private float _bobScale = 1f;
 
 	private void StepViewmodelProcedural(float dt)
 	{
@@ -466,28 +522,16 @@ public partial class LocalPlayer
 			gp.Y -= _stepSmoothOffset;
 			_cam.GlobalPosition = gp;
 		}
-		// Sprint FOV boost: widens FOV while sprinting (smoothstep-eased) and drives the sprint-blur overlay
-		// from the same eased value. FovBoost/FovBlendSpeed in ConVars.Cl.
 		bool sprinting = Movement?.ActuallySprinting ?? false;
 		_sprintFovBlend = Mathf.Lerp(_sprintFovBlend, sprinting ? 1f : 0f, Mathf.Min(1f, ConVars.Cl.FovBlendSpeed * dt));
 		float sprintEased = _sprintFovBlend * _sprintFovBlend * (3f - 2f * _sprintFovBlend);
 		float baseFov = HipFov + ConVars.Cl.FovBoost * sprintEased;
-		// Peripheral blur uses its own slower blend so it eases in gentler than the FOV boost.
 		_sprintBlurBlend = Mathf.Lerp(_sprintBlurBlend, sprinting ? 1f : 0f, Mathf.Min(1f, ConVars.Cl.SprintBlurBlendSpeed * dt));
 		float blurEased = _sprintBlurBlend * _sprintBlurBlend * (3f - 2f * _sprintBlurBlend);
 		UpdateSprintBlur(blurEased);
 		_cam.Fov = Mathf.Lerp(_cam.Fov, Mathf.Lerp(baseFov, AimFov, _aimBlend), Mathf.Clamp(dt * AimBlendSpeed, 0f, 1f));
 	}
 
-	private float _sprintFovBlend;
-	private float _sprintBlurBlend;
-	private ShaderMaterial _sprintBlurMat;
-	private ColorRect _sprintBlurRect;
-	private CanvasLayer _sprintBlurLayer;
-	private static readonly StringName _pSprintShader = "sprint";
-
-	/// <summary>Lazy-builds the sprint-blur overlay: a full-screen ColorRect running sprint_blur.gdshader on a
-	/// CanvasLayer behind the viewmodel (layer -1, so weapon/HUD stay crisp).</summary>
 	private void SetupSprintBlur()
 	{
 		if (_sprintBlurLayer != null || Engine.IsEditorHint())
@@ -509,7 +553,6 @@ public partial class LocalPlayer
 		AddChild(_sprintBlurLayer);
 	}
 
-	/// <summary>Shows/hides the sprint-blur overlay and feeds it the eased blend. Gated by the Motion Blur setting.</summary>
 	private void UpdateSprintBlur(float sprintEased)
 	{
 		SetupSprintBlur();
@@ -536,16 +579,6 @@ public partial class LocalPlayer
 			_viewmodelCam.Fov = _cam.Fov;
 	}
 
-	private PostProcessEffect _cachedPostFx;
-	private bool _postFxLookupDone;
-	private ShaderMaterial _viewmodelBlurMat;
-	private bool _viewmodelBlurLookupDone;
-	private static readonly StringName _pAdsBlendShader = "ads_blend";
-	private static readonly StringName _pSharpenShader = "sharpen_strength";
-
-	/// <summary>Fades in ADS depth-of-field: world cam focuses far via CameraAttributes DOF, weapon blurred by
-	/// the 2D viewmodel_ads_blur shader (DOF doesn't render in the weapon's transparent_bg SubViewport).
-	/// Also feeds AdsBlend into the screen-space post-FX.</summary>
 	private void UpdateAdsPostFx()
 	{
 		float adsBlend = _aimBlend;
@@ -570,13 +603,10 @@ public partial class LocalPlayer
 			_cachedPostFx.AdsBlend = adsBlend;
 		if (PostCanvasFx.Instance != null)
 			PostCanvasFx.Instance.AdsBlend = adsBlend;
-		// Same ADS vignette boost into the per-viewmodel post-FX so weapon edges darken on aim like the world.
 		if (ViewmodelMotionBlur.Effect != null)
 			ViewmodelMotionBlur.Effect.AdsBlend = adsBlend;
 	}
 
-	/// <summary>Drives viewmodel_ads_blur on the weapon SubViewportContainer — a 2D pseudo-DOF that keeps the
-	/// iron-sight zone sharp. Only way to blur the weapon, since CameraAttributes DOF doesn't render in its transparent_bg SubViewport.</summary>
 	private void ApplyViewmodelAdsBlur(float blend)
 	{
 		if (!_viewmodelBlurLookupDone)
@@ -591,7 +621,6 @@ public partial class LocalPlayer
 		_viewmodelBlurMat?.SetShaderParameter(_pSharpenShader, Settings.ViewmodelSharpenStrength);
 	}
 
-	/// <summary>World far-DOF for ADS. Far DOF stays on; only the amount fades with ADS (no per-frame toggle).</summary>
 	private void ApplyWorldAdsDof(float amount)
 	{
 		if (_cam?.Attributes is not CameraAttributesPractical a)
@@ -620,7 +649,6 @@ public partial class LocalPlayer
 		wbm.Transform = ads * crouch * canted * recoil;
 	}
 
-
 	private void PlayOneShot(string anim, bool aimed = false)
 	{
 		if (string.IsNullOrEmpty(anim) || _tree == null || _actionAnim == null || !_player.HasAnimation(anim))
@@ -641,80 +669,6 @@ public partial class LocalPlayer
 			return;
 		_locoStopAnim.Animation = anim;
 		_tree.Set(_pLocoStopRequest, (int)AnimationNodeOneShot.OneShotRequest.Fire);
-	}
-
-	protected override void ApplyEditorPreview(float dt = 0f)
-	{
-		var player = GetNodeOrNull<AnimationPlayer>(CharacterAnimationPath);
-		var tree = GetNodeOrNull<AnimationTree>(FpsTreePath);
-		if (player == null || tree == null)
-			return;
-
-		_leftHandFabrik ??= GetNodeOrNull<Node3D>(LeftHandFabrikPath);
-		_rightHandFabrik ??= GetNodeOrNull<Node3D>(RightHandFabrikPath);
-
-		if (!_editorTreeReady)
-		{
-			// Resolve _fpsWeapon/_tpsWeapon (+ cameras/IK) like runtime SetupSim does. The editor skips
-			// SetupSim, so without this UpdateActiveWeapon sets _currentWeapon = null (target _fpsWeapon
-			// never resolved) and the ADS getters fall back to defaults instead of the weapon's offsets.
-			ResolveWeaponPlayers();
-			UpdateActiveWeapon();
-			// Full runtime tree wiring so the editor preview evaluates identically to in-game.
-			_player = player;
-			BuildAnimationTree();
-			ApplyViewmodelLayer();
-			_editorTreeReady = true;
-		}
-
-		// Editor test toggles force each blend independently so ADS/crouch/canted offsets can be calibrated
-		// alone or combined (AdsTestMode + CrouchTestMode = crouched ADS). Canted is an ADS variant, so it implies aiming.
-		bool aiming = _isAiming || AdsTestMode || CantedTestMode;
-		_aimBlend = aiming ? 1f : 0f;
-		_crouchBlend = (_isCrouched || CrouchTestMode) ? 1f : 0f;
-		_cantedBlend = ((_cantedAim && aiming) || CantedTestMode) ? 1f : 0f;
-
-		tree.Set(_pAimMix, _aimBlend);
-		tree.Set(_pStandSprint, _sprintAmt);
-		tree.Set(_pStandRun, Mathf.Max(_runAmt, _sprintAmt));
-		tree.Set(_pCrouchMix, _crouchBlend);
-		tree.Set(_pStandWalk, _simVel);
-		tree.Set(_pAimLoco, _simVel);
-		tree.Set(_pCrouchLoco, _simVel);
-		var editorFastMovement = _sprintAmt > 0.05f || _runAmt > 0.5f;
-		float gripAmt = _grip != GripType.Standard && !editorFastMovement ? 1f : 0f;
-		tree.Set(_pGripAdd, gripAmt);
-		tree.Set(_pGripAimBlend, _aimBlend);
-		if (_grip != GripType.Standard && tree.TreeRoot is AnimationNodeBlendTree bt)
-		{
-			string nonAim = _grip == GripType.Angled ? IdlePoseGripAngled : IdlePoseGripVertical;
-			string aim = _grip == GripType.Angled ? AimPoseGripAngled : AimPoseGripVertical;
-			if (bt.HasNode("GripPose") && bt.GetNode("GripPose") is AnimationNodeAnimation gp)
-				gp.Animation = nonAim;
-			if (bt.HasNode("GripPoseAim") && bt.GetNode("GripPoseAim") is AnimationNodeAnimation gpa)
-				gpa.Animation = aim;
-		}
-		_cam ??= GetNodeOrNull<Camera3D>(HeadCameraPath);
-		_viewmodelCam ??= GetNodeOrNull<Camera3D>(ViewmodelCameraPath);
-		_viewmodelCamAnchor ??= GetNodeOrNull<Node3D>(ViewmodelCameraAnchorPath);
-		_tpsCam ??= GetNodeOrNull<Camera3D>(TpsCameraPath);
-		_viewmodelLayer ??= GetNodeOrNull<CanvasLayer>(ViewmodelLayerPath);
-		ApplyModeVisibility();
-		if (_cam != null)
-			_cam.Fov = aiming ? AimFov : HipFov;
-
-		var ikInfluence = IkEnabled ? 1f : 0f;
-		_leftHandFabrik?.Set(_pInfluence, ikInfluence);
-		_rightHandFabrik?.Set(_pInfluence, ikInfluence);
-
-		ApplyWeaponOffset();
-		// Advance with the real delta even in ADS-test mode. A 0.0 advance only holds the previous pose
-		// (doesn't re-evaluate the graph), so AimMix=1 never bakes, the skeleton never re-poses, and the
-		// WeaponBoneModifier (ADS offset) never runs. Advancing every frame keeps the aimed pose + offset
-		// live for calibration; locomotion is forced to idle above, so only idle breathing remains.
-		tree.Advance(dt);
-		RenderFpsCamera();
-		UpdateAdsCrosshair();
 	}
 
 	private void UpdateAdsCrosshair()
@@ -777,37 +731,67 @@ public partial class LocalPlayer
 		_adsMarker = _adsLineH = _adsLineV = null;
 	}
 
-	// Local-only view state (moved from NetworkPlayer; used only by this partial).
-	private Vector2 _lookDelta;
-	private float _crouchBlend;
-	private float _cantedBlend;
-	private Vector3 _swayCurrent;
-	private Vector3 _recoilVel;
-	private Transform3D _camRestLocal;
-	private Transform3D _eyeRest;
-	private bool _camRigCaptured;
-	private bool _adsTestPrev;
-	private MeshInstance3D _adsMarker, _adsLineH, _adsLineV;
-	private float _gripAimBlend;
-	private bool _montageActive;
-	private GripType _pendingGrip;
-	private float _gripSwitchDelay = -1f;
-	private float _gripBlend;
-	private bool _editorTreeReady;
-	private bool _wasNearStop = true;
-	private bool _sprintStopArmed;
-	private bool _walkStopArmed;
-	private Vector3 _smoothedDirRatio;
-	private Vector3 _dirLeanSpringVel;
-	private Vector3 _prevProcVelocity;
-	private Vector3 _inertiaTilt;
-	private float _prevBodyYaw;
-	private float _prevBodyPitch;
-	private bool _bodyYawInit;
-	private float _bodyYawLag;
-	private float _bodyPitchLag;
-	private Vector3 _mouseInertia;
-	private Vector3 _mouseInertiaSmoothed;
-	private Vector3 _viewSwayPos;
-	private Vector3 _viewSwayRotDeg;
+	protected override void ApplyEditorPreview(float dt = 0f)
+	{
+		var player = GetNodeOrNull<AnimationPlayer>(CharacterAnimationPath);
+		var tree = GetNodeOrNull<AnimationTree>(FpsTreePath);
+		if (player == null || tree == null)
+			return;
+
+		_leftHandFabrik ??= GetNodeOrNull<Node3D>(LeftHandFabrikPath);
+		_rightHandFabrik ??= GetNodeOrNull<Node3D>(RightHandFabrikPath);
+
+		if (!_editorTreeReady)
+		{
+			ResolveWeaponPlayers();
+			UpdateActiveWeapon();
+			_player = player;
+			BuildAnimationTree();
+			ApplyViewmodelLayer();
+			_editorTreeReady = true;
+		}
+
+		bool aiming = _isAiming || AdsTestMode || CantedTestMode;
+		_aimBlend = aiming ? 1f : 0f;
+		_crouchBlend = (_isCrouched || CrouchTestMode) ? 1f : 0f;
+		_cantedBlend = ((_cantedAim && aiming) || CantedTestMode) ? 1f : 0f;
+
+		tree.Set(_pAimMix, _aimBlend);
+		tree.Set(_pStandSprint, _sprintAmt);
+		tree.Set(_pStandRun, Mathf.Max(_runAmt, _sprintAmt));
+		tree.Set(_pCrouchMix, _crouchBlend);
+		tree.Set(_pStandWalk, _simVel);
+		tree.Set(_pAimLoco, _simVel);
+		tree.Set(_pCrouchLoco, _simVel);
+		var editorFastMovement = _sprintAmt > 0.05f || _runAmt > 0.5f;
+		float gripAmt = _grip != GripType.Standard && !editorFastMovement ? 1f : 0f;
+		tree.Set(_pGripAdd, gripAmt);
+		tree.Set(_pGripAimBlend, _aimBlend);
+		if (_grip != GripType.Standard && tree.TreeRoot is AnimationNodeBlendTree bt)
+		{
+			string nonAim = _grip == GripType.Angled ? IdlePoseGripAngled : IdlePoseGripVertical;
+			string aim = _grip == GripType.Angled ? AimPoseGripAngled : AimPoseGripVertical;
+			if (bt.HasNode("GripPose") && bt.GetNode("GripPose") is AnimationNodeAnimation gp)
+				gp.Animation = nonAim;
+			if (bt.HasNode("GripPoseAim") && bt.GetNode("GripPoseAim") is AnimationNodeAnimation gpa)
+				gpa.Animation = aim;
+		}
+		_cam ??= GetNodeOrNull<Camera3D>(HeadCameraPath);
+		_viewmodelCam ??= GetNodeOrNull<Camera3D>(ViewmodelCameraPath);
+		_viewmodelCamAnchor ??= GetNodeOrNull<Node3D>(ViewmodelCameraAnchorPath);
+		_tpsCam ??= GetNodeOrNull<Camera3D>(TpsCameraPath);
+		_viewmodelLayer ??= GetNodeOrNull<CanvasLayer>(ViewmodelLayerPath);
+		ApplyModeVisibility();
+		if (_cam != null)
+			_cam.Fov = aiming ? AimFov : HipFov;
+
+		var ikInfluence = IkEnabled ? 1f : 0f;
+		_leftHandFabrik?.Set(_pInfluence, ikInfluence);
+		_rightHandFabrik?.Set(_pInfluence, ikInfluence);
+
+		ApplyWeaponOffset();
+		tree.Advance(dt);
+		RenderFpsCamera();
+		UpdateAdsCrosshair();
+	}
 }

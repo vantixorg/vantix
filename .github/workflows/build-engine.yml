@@ -14,7 +14,8 @@ permissions:
   contents: read
 
 env:
-  GODOT_REF: "4.6.3-stable"
+  GODOT_REF: "4.7-rc3"
+  GODOT_SOURCE_SHA: "645638db91769059ed061450e6b348a7033d4225"
 
 jobs:
   engine:
@@ -59,10 +60,14 @@ jobs:
         if: steps.cache.outputs.cache-hit != 'true'
         run: python -m pip install scons
 
-      - name: Clone Godot source @ ${{ env.GODOT_REF }}
+      - name: Clone Godot source @ ${{ env.GODOT_REF }} (${{ env.GODOT_SOURCE_SHA }})
         if: steps.cache.outputs.cache-hit != 'true'
         shell: bash
-        run: git clone --depth 1 --branch "$GODOT_REF" https://github.com/godotengine/godot.git EngineSource/godot
+        run: |
+          git init EngineSource/godot
+          git -C EngineSource/godot remote add origin https://github.com/godotengine/godot.git
+          git -C EngineSource/godot fetch --depth 1 origin "$GODOT_SOURCE_SHA"
+          git -C EngineSource/godot checkout --detach FETCH_HEAD
 
       - name: Bootstrap stock editor (Windows)
         if: matrix.id == 'windows' && steps.cache.outputs.cache-hit != 'true'
